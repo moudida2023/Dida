@@ -9,7 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 app = Flask(__name__)
 
 # --- إعدادات التلجرام للمجموعة ---
-TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
+TOKEN = "8492941812:AAEpBgsiYGRdWdC80V2lNpuBXtcz4pxGRLA"
 
 # أضف هنا أرقام الـ ID الخاصة بأصدقائك (تأكد أن كل صديق قد ضغط Start للبوت)
 FRIENDS_IDS = [
