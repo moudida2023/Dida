@@ -1,0 +1,8 @@
+flask
+ccxt
+pandas
+numpy
+requests
+apscheduler
+gunicorn
+fpdf
