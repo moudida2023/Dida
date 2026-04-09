@@ -1,14 +1,4 @@
-Aucun élément sélectionné
 
-Aller au contenu
-Utiliser Gmail avec un lecteur d'écran
-Activez les notifications sur le bureau pour Gmail.
-   OK  Non, merci
-Conversations
-63 % sur 15 Go utilisés
-Conditions d'utilisation · Confidentialité · Règlement du programme
-Dernière activité sur le compte : il y a 22 minutes
-Détails
 import asyncio
 import ccxt.pro as ccxt
 import pandas as pd
