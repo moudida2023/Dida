@@ -9,17 +9,8 @@ import gc
 from flask import Flask
 from datetime import datetime, timedelta
 
-# ======================== 1. الإعدادات والذاكرة المحسنة ========================
-TELEGRAM_TOKEN = '8603477836:AAGG6Outg3Z9vBI-NjWQ3ALJroh_Cye3l2c'
-TELEGRAM_CHAT_ID = '-1003692815602'
 
-> Dream Agency:
-import os
-import requests
-import ccxt
-import pandas as pd
-import numpy as np
-from flask import Flask
+
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(name)
