@@ -22,4 +22,4 @@ COPY . .
 EXPOSE 10000
 
 # الأمر النهائي لتشغيل البوت
-CMD ["python", "main.py"]
+CMD ["python", "app.py"]
