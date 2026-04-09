@@ -1,4 +1,3 @@
-
 import asyncio
 import ccxt.pro as ccxt
 import pandas as pd
