@@ -7,189 +7,158 @@ import threading
 from flask import Flask
 from datetime import datetime, timedelta
 
-# ======================== 1. الإعدادات والذاكرة ========================
+# ======================== 1. الإعدادات والبيانات الأساسية ========================
 app = Flask('')
-
-# إعدادات التلجرام وباينانس
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# رابط التطبيق على رندر (تأكد من تحديثه بعد الرفع لإبقاء البوت حياً)
+# ملاحظة: ضع رابط تطبيقك بعد الرفع هنا لضمان استمرار العمل
 RENDER_URL = "https://your-app-name.onrender.com/" 
 
 # إعدادات المحفظة الافتراضية
 INITIAL_BALANCE = 500.0
 CURRENT_BALANCE = 500.0
 MAX_TRADES = 10
-TRADE_AMOUNT = 50.0  # توزيع 500$ على 10 صفقات
-OPEN_TRADES = {}     # الصفقات المفتوحة حالياً
-CLOSED_TRADES = []   # سجل الصفقات المغلقة
-PREVIOUS_SIGNALS = set() # ذاكرة لتأكيد استمرارية الإشارة
+TRADE_AMOUNT = 50.0 
+OPEN_TRADES = {}     
+CLOSED_TRADES = []   
 
 @app.route('/')
 def home():
-    return f"🚀 Sniper Bot Active | Balance: {CURRENT_BALANCE:.2f}$ | Open Trades: {len(OPEN_TRADES)}"
+    return f"🚀 Sniper Elite Bot Active | Balance: {CURRENT_BALANCE:.2f}$ | Open: {len(OPEN_TRADES)}"
 
-# ======================== 2. محرك التحليل الفني المطور ========================
+# ======================== 2. محرك التقييم الفني (Scoring) ========================
 
-def calculate_advanced_metrics(df):
+def calculate_advanced_score(df):
     try:
+        if len(df) < 200: return 0
         close = df['close']
-        # 1. البولنجر باند والضيق (Squeeze)
-        sma = close.rolling(20).mean()
-        std = close.rolling(20).std()
-        df['width'] = (4 * std) / (sma + 1e-9)
         
-        # 2. فلتر الاتجاه العام (EMA 200) لضمان الدخول مع التيار
-        df['ema_200'] = close.ewm(span=200, adjust=False).mean()
+        # --- حساب المؤشرات الفنية ---
+        # RSI
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
         
-        # 3. فلتر حجم التداول (Volume Spike) للتأكد من وجود زخم
-        df['vol_avg_10'] = df['vol'].rolling(window=10).mean()
-        
-        # 4. تدفق السيولة (MFI) لمعرفة دخول الأموال الذكية
+        # MFI (تدفق السيولة)
         tp = (df['high'] + df['low'] + close) / 3
         mf = tp * df['vol']
         pos_f = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
         neg_f = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
-        df['mfi'] = 100 - (100 / (1 + (pos_f / (neg_f + 1e-9))))
+        mfi = 100 - (100 / (1 + (pos_f / (neg_f + 1e-9))))
         
-        return df
-    except:
-        return df
+        # Bollinger Width (الانضغاط)
+        sma = close.rolling(20).mean()
+        std = close.rolling(20).std()
+        width = (4 * std) / (sma + 1e-9)
+        
+        # EMA 200 (الاتجاه العام)
+        ema200 = close.ewm(span=200, adjust=False).mean()
 
-def check_entry_signal(df):
-    if df.empty or len(df) < 200: return False, None
-    last = df.iloc[-1]
-    
-    # شروط الدخول الذهبية لربح 6% باستقرار
-    is_uptrend = last['close'] > last['ema_200']             # السعر فوق EMA 200
-    is_squeezed = last['width'] < 0.05                      # انضغاط سعري أقل من 5%
-    has_volume = last['vol'] > (last['vol_avg_10'] * 1.2)   # انفجار في حجم التداول
-    has_money_flow = last['mfi'] > 55                       # سيولة شرائية واضحة
-    
-    if is_uptrend and is_squeezed and has_volume and has_money_flow:
-        return True, last['close']
-    return False, None
+        # --- توزيع الدرجات (Score out of 100) ---
+        score = 0
+        last = -1
+        
+        if close.iloc[last] > ema200.iloc[last]: score += 20    # فوق متوسط 200 (+20)
+        if width.iloc[last] < 0.035: score += 40               # انضغاط قوي جداً (+40)
+        elif width.iloc[last] < 0.05: score += 20              # انضغاط متوسط (+20)
+        if 50 < rsi.iloc[last] < 65: score += 20               # منطقة انطلاق (+20)
+        if mfi.iloc[last] > 60: score += 20                    # دخول سيولة حقيقية (+20)
+        
+        return score
+    except: return 0
 
-# ======================== 3. نظام التنبيهات والتقارير ========================
+# ======================== 3. دورة القنص والمراقبة ========================
 
-def send_telegram(msg):
-    for cid in DESTINATIONS:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-        except: pass
-
-def get_status_report():
-    report = f"📊 *تقرير المحفظة المباشر*\n"
-    report += f"💰 الرصيد المتوفر: `{CURRENT_BALANCE:.2f}$`\n"
-    report += f"📍 صفقات نشطة: `{len(OPEN_TRADES)}/{MAX_TRADES}`\n"
-    report += "───────────────────\n"
-    if OPEN_TRADES:
-        for sym, data in OPEN_TRADES.items():
-            pnl_pct = ((data['current'] - data['entry']) / data['entry']) * 100
-            report += f"• *{sym}*: `{pnl_pct:+.2f}%` | دخول: `{data['entry']:.4f}`\n"
-    else:
-        report += "_لا توجد صفقات مفتوحة حالياً._\n"
-    return report
-
-# ======================== 4. المهام الآلية (Async Tasks) ========================
-
-async def scan_and_trade():
-    global PREVIOUS_SIGNALS, CURRENT_BALANCE
-    current_index = 0
-    BATCH_SIZE = 50 
-
+async def sniper_cycle():
+    global CURRENT_BALANCE
     while True:
         try:
+            start_time = datetime.now()
+            send_telegram("🔍 *بدء دورة المسح الشامل (500 عملة)...*")
+            
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s 
                        and s not in ['BTC/USDT', 'ETH/USDT', 'USDC/USDT', 'FDUSD/USDT']]
             
-            batch = symbols[current_index : current_index + BATCH_SIZE]
-            current_index = 0 if current_index + BATCH_SIZE >= len(symbols) else current_index + BATCH_SIZE
+            candidates = []
             
-            current_cycle_signals = []
-            for sym in batch:
-                if len(OPEN_TRADES) >= MAX_TRADES: break
+            # مسح العملات واحدة تلو الأخرى
+            for sym in symbols:
                 if sym in OPEN_TRADES: continue
-                
                 try:
-                    bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='4h', limit=210)
+                    bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='4h', limit=205)
                     df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
-                    df = calculate_advanced_metrics(df)
-                    can_enter, entry_price = check_entry_signal(df)
+                    score = calculate_advanced_score(df)
                     
-                    if can_enter:
-                        if sym in PREVIOUS_SIGNALS: # تأكيد الاستمرارية للدورة الثانية
-                            OPEN_TRADES[sym] = {'entry': entry_price, 'current': entry_price, 'time': datetime.now()}
-                            CURRENT_BALANCE -= TRADE_AMOUNT
-                            send_telegram(f"🚀 *دخول صفقة جديدة*\n💎 العملة: `{sym}`\n💰 السعر: `{entry_price:.6f}`\n📈 الاتجاه: `صاعد 4H`")
-                        current_cycle_signals.append(sym)
+                    if score >= 80: # الدخول فقط في النخبة
+                        candidates.append({'symbol': sym, 'score': score, 'price': df['close'].iloc[-1]})
                 except: continue
-                await asyncio.sleep(0.02)
-            
-            PREVIOUS_SIGNALS = set(current_cycle_signals)
-        except Exception as e: print(f"Scan Error: {e}")
-        await asyncio.sleep(300)
+                await asyncio.sleep(0.01) # حماية من حظر API
+
+            # اختيار الأفضل والدخول
+            if candidates and len(OPEN_TRADES) < MAX_TRADES:
+                best = sorted(candidates, key=lambda x: x['score'], reverse=True)[0]
+                sym, price, scr = best['symbol'], best['price'], best['score']
+                
+                OPEN_TRADES[sym] = {'entry': price, 'current': price, 'time': datetime.now()}
+                CURRENT_BALANCE -= TRADE_AMOUNT
+                
+                send_telegram(f"🎯 *قنص أفضل عملة لهذه الدورة*\n💎 العملة: `{sym}`\n🏆 السكور: `{scr}/100`\n💰 السعر: `{price:.6f}`\n📍 المتبقي: `{CURRENT_BALANCE:.2f}$`")
+            else:
+                send_telegram("⚠️ *انتهى المسح: لم توجد فرص بسكور مرتفع حالياً.*")
+
+            # ضبط الدورة لتتكرر كل 30 دقيقة بالضبط
+            elapsed = (datetime.now() - start_time).total_seconds()
+            await asyncio.sleep(max(0, 1800 - elapsed))
+
+        except Exception as e:
+            print(f"Error: {e}")
+            await asyncio.sleep(60)
 
 async def monitor_pnl():
-    global CURRENT_BALANCE, OPEN_TRADES, CLOSED_TRADES
+    global CURRENT_BALANCE
     while True:
         try:
             if OPEN_TRADES:
                 tickers = await EXCHANGE.fetch_tickers(list(OPEN_TRADES.keys()))
                 for sym in list(OPEN_TRADES.keys()):
                     curr_price = tickers[sym]['last']
-                    OPEN_TRADES[sym]['current'] = curr_price
-                    change = (curr_price - OPEN_TRADES[sym]['entry']) / OPEN_TRADES[sym]['entry']
+                    entry = OPEN_TRADES[sym]['entry']
+                    change = (curr_price - entry) / entry
                     
-                    # الخروج: ربح 6% أو خسارة 3%
+                    # الخروج بربح 6% أو خسارة 3%
                     if change >= 0.06 or change <= -0.03:
                         pnl = TRADE_AMOUNT * change
                         CURRENT_BALANCE += (TRADE_AMOUNT + pnl)
-                        result = "✅ هدف (+6%)" if change >= 0.06 else "❌ وقف (-3%)"
-                        send_telegram(f"🔔 *إغلاق صفقة*\n💎 العملة: `{sym}`\n📢 النتيجة: `{result}`\n💰 الربح/الخسارة: `{pnl:+.2f}$`")
-                        CLOSED_TRADES.append({'pnl': pnl, 'time': datetime.now()})
+                        status = "✅ هدف +6%" if change >= 0.06 else "❌ وقف -3%"
+                        send_telegram(f"🔔 *إغلاق صفقة*\n💎 `{sym}` | {status}\n💰 الربح/الخسارة: `{pnl:+.2f}$`\n💵 الرصيد الحالي: `{CURRENT_BALANCE:.2f}$`")
                         del OPEN_TRADES[sym]
         except: pass
         await asyncio.sleep(20)
 
 async def keep_alive():
-    """هذه الدالة تمنع رندر من إغلاق البوت (Keep-Alive)"""
     while True:
-        try:
-            requests.get(RENDER_URL, timeout=10)
+        try: requests.get(RENDER_URL, timeout=10)
         except: pass
-        await asyncio.sleep(600) # كل 10 دقائق
+        await asyncio.sleep(600)
 
-async def report_scheduler():
-    next_hour = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    while True:
-        now = datetime.now()
-        if now >= next_hour:
-            send_telegram(get_status_report())
-            next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        await asyncio.sleep(60)
+def send_telegram(msg):
+    for cid in DESTINATIONS:
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                          json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        except: pass
 
-# ======================== 5. الانطلاق ========================
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080, use_reloader=False)
+# ======================== 4. التشغيل النهائي ========================
 
 if __name__ == "__main__":
-    # تشغيل Flask للسيرفر في الخلفية
-    threading.Thread(target=run_flask, daemon=True).start()
+    # تشغيل سيرفر ويب صغير في الخلفية
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, use_reloader=False), daemon=True).start()
     
-    # تشغيل المحركات الأساسية
     loop = asyncio.get_event_loop()
-    loop.create_task(scan_and_trade())
+    loop.create_task(sniper_cycle())
     loop.create_task(monitor_pnl())
-    loop.create_task(report_scheduler())
     loop.create_task(keep_alive())
-    
-    try:
-        loop.run_forever()
-    except Exception as e:
-        print(f"Bot Crashed: {e}")
+    loop.run_forever()
