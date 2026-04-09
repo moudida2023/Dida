@@ -12,10 +12,9 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "🚀 Bot is Running and Healthy!"
+    return "🚀 Snowball Bot is Active | Balance: $500 | Max 5 Trades"
 
 def run_flask():
-    # Render يمرر البوت عبر متغير البيئة PORT تلقائياً
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
@@ -24,50 +23,51 @@ TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# إعدادات الاستراتيجية
-VIRTUAL_BALANCE = 1000.0
+# إعدادات المحفظة
+VIRTUAL_BALANCE = 500.0
+START_DAY_BALANCE = 500.0
+TRADE_AMOUNT = 50.0      
+MAX_OPEN_TRADES = 5      
 portfolio = {"open_trades": {}}
-closed_trades_log = []
-MIN_VOLUME_24H = 5000000 # 5 مليون دولار
+closed_trades_history = []
+MIN_VOLUME_24H = 5000000 
 
-# ======================== 3. أدوات التحليل والمؤشرات ========================
+# ======================== 3. منطق التحليل والمؤشرات ========================
 
 async def is_market_safe():
-    """فلتر البيتكوين: هل السوق يسمح بالـ Short؟"""
+    """فلتر البيتكوين لمنع البيع في سوق صاعد بقوة"""
     try:
         btc = await EXCHANGE.fetch_ticker('BTC/USDT')
-        return (btc['percentage'] or 0) < 1.5 # لا ندخل لو البيتكوين صاعد بقوة
+        return (btc['percentage'] or 0) < 1.5 
     except: return True
 
 def get_targets(df):
-    """حساب الأهداف بناءً على فيبوناتشي ووقف الخسارة"""
+    """حساب مستويات الخروج بناءً على فيبوناتشي 50%"""
     peak = df['high'].max()
     low = df['low'].min()
     entry = df.iloc[-1]['close']
-    
-    target = peak - (peak - low) * 0.5 # هدف 50% فيبوناتشي
-    stop_loss = peak * 1.015 # وقف 1.5% فوق القمة
-    
+    target = peak - (peak - low) * 0.5 
+    stop_loss = peak * 1.015 
     expected_profit = ((entry - target) / entry) * 100
     return target, stop_loss, expected_profit
 
 def detect_reversal(df):
     """اكتشاف شمعة الشهاب مع تأكيد الإغلاق والحجم"""
-    prev = df.iloc[-2] # شمعة الإشارة
-    last = df.iloc[-1] # شمعة التأكيد
-    
+    prev = df.iloc[-2] 
+    last = df.iloc[-1] 
     body = abs(prev['close'] - prev['open'])
     upper_wick = prev['high'] - max(prev['open'], prev['close'])
     avg_vol = df['vol'].rolling(10).mean().iloc[-2]
     
-    # الشروط: ذيل طويل + إغلاق تحت القاع السابق + حجم عالي
     if upper_wick > (1.8 * body) and last['close'] < prev['low'] and prev['vol'] > avg_vol:
         return True
     return False
 
-# ======================== 4. منطق المسح وإدارة الصفقات ========================
+# ======================== 4. إدارة العمليات والصفقات ========================
 
 async def scan_market():
+    global VIRTUAL_BALANCE
+    if len(portfolio["open_trades"]) >= MAX_OPEN_TRADES: return
     if not await is_market_safe(): return
     
     try:
@@ -77,26 +77,29 @@ async def scan_market():
                    and (tickers[s]['quoteVolume'] or 0) > MIN_VOLUME_24H]
         
         for sym in symbols:
+            if len(portfolio["open_trades"]) >= MAX_OPEN_TRADES: break
             if sym in portfolio["open_trades"]: continue
-            
+            if VIRTUAL_BALANCE < TRADE_AMOUNT: continue 
+
             bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=40)
             df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
             
             if detect_reversal(df):
                 tp, sl, profit_pct = get_targets(df)
-                
-                # فلتر الـ 5% المطلوب
                 if profit_pct >= 5.0:
                     entry_p = df.iloc[-1]['close']
+                    VIRTUAL_BALANCE -= TRADE_AMOUNT
                     portfolio["open_trades"][sym] = {
                         "entry_price": entry_p,
                         "target": tp,
                         "stop_loss": sl,
-                        "entry_time": datetime.now()
+                        "trailing_sl": sl,
+                        "amount": TRADE_AMOUNT,
+                        "entry_time": datetime.now(),
+                        "trailing_active": False
                     }
-                    send_telegram_msg(f"🛡️ *إشارة دخول مؤكدة*\n🎫 {sym}\n💰 السعر: {entry_p:.6f}\n🎯 الهدف: {tp:.6f}\n📈 ربح متوقع: {profit_pct:.2f}%")
-    except Exception as e:
-        print(f"Scan Error: {e}")
+                    send_telegram_msg(f"🛡️ *دخول جديد (Short)*\n🎫 {sym}\n💰 السعر: {entry_p:.6f}\n🎯 الهدف: {tp:.6f}\n📦 الصفقات: {len(portfolio['open_trades'])}/5")
+    except: pass
 
 async def manage_trades():
     global VIRTUAL_BALANCE
@@ -106,34 +109,55 @@ async def manage_trades():
                 trade = portfolio["open_trades"][sym]
                 ticker = await EXCHANGE.fetch_ticker(sym)
                 cp = ticker['last']
+                pnl_ratio = (trade['entry_price'] - cp) / trade['entry_price']
+                pnl_pct = pnl_ratio * 100
                 
-                pnl = (trade['entry_price'] - cp) / trade['entry_price'] * 100
-                duration = datetime.now() - trade['entry_time']
-                
+                # تحديث التتبع السعري (Trailing)
+                if pnl_pct >= 2.0: trade["trailing_active"] = True
+                if trade["trailing_active"]:
+                    new_sl = cp * 1.015
+                    if new_sl < trade["trailing_sl"]: trade["trailing_sl"] = new_sl
+
+                # منطق الخروج
                 reason = None
-                if cp <= trade['target']: reason = "🎯 Target Hit"
-                elif cp >= trade['stop_loss']: reason = "🛑 Stop Loss Hit"
-                elif duration > timedelta(hours=4): reason = "⏰ Time Exit (4h)"
+                if cp <= trade['target']: reason = "🎯 الهدف الثابت"
+                elif cp >= trade['trailing_sl']: reason = "🛡️ التتبع/الوقف"
+                elif (datetime.now() - trade['entry_time']) > timedelta(hours=4): reason = "⏰ الوقت (4س)"
                 
                 if reason:
-                    VIRTUAL_BALANCE += 100 * (1 + (pnl/100))
-                    closed_trades_log.append(pnl)
-                    icon = "✅" if pnl > 0 else "❌"
-                    send_telegram_msg(f"🏁 *إغلاق صفقة*\n🎫 {sym}\n📊 النتيجة: {icon} {pnl:+.2f}%\n📝 السبب: {reason}\n💰 الرصيد: ${VIRTUAL_BALANCE:.2f}")
+                    final_ret = trade['amount'] * (1 + pnl_ratio)
+                    VIRTUAL_BALANCE += final_ret
+                    closed_trades_history.append({"sym": sym, "pnl": pnl_pct, "time": datetime.now()})
+                    icon = "✅" if pnl_pct > 0 else "❌"
+                    send_telegram_msg(f"🏁 *إغلاق صفقة*\n🎫 {sym}\n📊 النتيجة: {icon} {pnl_pct:+.2f}%\n📝 السبب: {reason}\n💵 الرصيد: ${VIRTUAL_BALANCE:.2f}")
                     del portfolio["open_trades"][sym]
             except: continue
-        await asyncio.sleep(30)
+        await asyncio.sleep(15) # تحديث كل 15 ثانية بناءً على طلبك
+
+# ======================== 5. نظام التقارير (ساعي ويومي) ========================
 
 async def hourly_report():
     while True:
         await asyncio.sleep(3600)
-        report = (f"📊 *تقرير الأداء الساعي*\n---------------------------\n"
-                  f"💰 الرصيد: ${VIRTUAL_BALANCE:.2f}\n"
-                  f"📦 صفقات مفتوحة: {len(portfolio['open_trades'])}\n"
-                  f"✅ صفقات مغلقة: {len(closed_trades_log)}")
-        send_telegram_msg(report)
+        open_list = "".join([f"• {s}: {( (t['entry_price'] - (await EXCHANGE.fetch_ticker(s))['last']) / t['entry_price'] * 100):+.2f}%\n" for s, t in portfolio["open_trades"].items()])
+        msg = f"📊 *تقرير الساعة*\n-------------------\n💵 الرصيد: ${VIRTUAL_BALANCE:.2f}\n📦 المفتوح:\n{open_list if open_list else 'لا يوجد'}"
+        send_telegram_msg(msg)
 
-# ======================== 5. الوظائف العامة والتشغيل ========================
+async def daily_report():
+    global START_DAY_BALANCE
+    while True:
+        await asyncio.sleep(86400)
+        day_trades = [t for t in closed_trades_history if t['time'] > (datetime.now() - timedelta(days=1))]
+        if day_trades:
+            wins = len([t for t in day_trades if t['pnl'] > 0])
+            total_pnl = sum([t['pnl'] for t in day_trades])
+            msg = (f"📅 *التقرير اليومي*\n-------------------\n💰 الرصيد: ${VIRTUAL_BALANCE:.2f}\n"
+                   f"📈 التطور: ${VIRTUAL_BALANCE - START_DAY_BALANCE:+.2f}\n✅ صفقات ناجحة: {wins}/{len(day_trades)}\n"
+                   f"🏆 Win Rate: {(wins/len(day_trades)*100):.1f}%")
+            send_telegram_msg(msg)
+            START_DAY_BALANCE = VIRTUAL_BALANCE
+
+# ======================== 6. التشغيل ========================
 
 def send_telegram_msg(msg):
     for chat_id in DESTINATIONS:
@@ -143,19 +167,15 @@ def send_telegram_msg(msg):
         except: pass
 
 async def main_loop():
-    send_telegram_msg("🚀 *النظام يعمل الآن بنجاح على Render!*")
+    send_telegram_msg("🚀 *تم تشغيل النظام بالكامل*\nرصيد: $500 | دخول: $50 | تتبع: نشط")
     while True:
         await scan_market()
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    # تشغيل Flask كخلفية لفتح البورت
-    t = threading.Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-    
-    # تشغيل مهام البوت
+    threading.Thread(target=run_flask, daemon=True).start()
     loop = asyncio.get_event_loop()
     loop.create_task(manage_trades())
     loop.create_task(hourly_report())
+    loop.create_task(daily_report())
     loop.run_until_complete(main_loop())
