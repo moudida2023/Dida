@@ -9,8 +9,6 @@ import gc
 from flask import Flask
 from datetime import datetime, timedelta
 
-
-
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(name)
