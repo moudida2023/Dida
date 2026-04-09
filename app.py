@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 # ======================== 1. الإعدادات والذاكرة المحسنة ========================
 TELEGRAM_TOKEN = '8603477836:AAGG6Outg3Z9vBI-NjWQ3ALJroh_Cye3l2c'
-TELEGRAM_CHAT_ID = '-1003692815602'
+TELEGRAM_CHAT_ID = '5067771509'
 
 > Dream Agency:
 import os
