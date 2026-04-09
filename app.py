@@ -7,8 +7,13 @@ import os
 import gc
 from flask import Flask
 from datetime import datetime, timedelta
-
 from apscheduler.schedulers.background import BackgroundScheduler
+app = Flask(name)
+
+# ======================== 1. الإعدادات والذاكرة المحسنة ========================
+TELEGRAM_TOKEN = '8603477836:AAGG6Outg3Z9vBI-NjWQ3ALJroh_Cye3l2c'
+TELEGRAM_CHAT_ID = '-5067771509'
+
 app = Flask(name)
 
 # --- إعدادات التلجرام للمجموعة ---
@@ -16,7 +21,7 @@ TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 
 # أضف هنا أرقام الـ ID الخاصة بأصدقائك (تأكد أن كل صديق قد ضغط Start للبوت)
 FRIENDS_IDS = [
-    "-1003692815602", # الـ ID الخاص بك
+    "5067771509", # الـ ID الخاص بك
     "2107567005"# الـ ID الصديق الأول
 
 ]
@@ -353,5 +358,3 @@ def send_telegram_msg(msg):
     except: pass
 
 # ... (بقية دوال الفلاسك والتشغيل)
-app - 2026-04-09T070750.231.py
-Affichage de app - 2026-04-09T070750.231.py en cours...
