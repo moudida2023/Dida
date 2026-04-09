@@ -4,178 +4,119 @@ import pandas as pd
 import requests
 import os
 import threading
+import numpy as np
 from flask import Flask
 from datetime import datetime, timedelta
 
-# ======================== 1. إعدادات السيرفر (حل مشكلة توقف Render) ========================
+# ======================== 1. إعدادات السيرفر والتلجرام ========================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "🚀 Snowball Bot is Active | Mode: Aggressive | Max 5 Trades"
+    return "🚀 Crypto Squeeze & Divergence Bot is Active"
 
 def run_flask():
-    # Render يمرر البورت تلقائياً عبر متغيرات البيئة
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# ======================== 2. الإعدادات والمعرفات ========================
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# إعدادات المحفظة وإدارة المخاطر
-VIRTUAL_BALANCE = 500.0        # الرصيد الافتراضي الابتدائي
-START_DAY_BALANCE = 500.0      # لتعقب النمو اليومي
-TRADE_AMOUNT = 50.0            # قيمة الدخول في كل صفقة
-MAX_OPEN_TRADES = 5            # الحد الأقصى للصفقات المتزامنة
-portfolio = {"open_trades": {}}
-closed_trades_history = []
-MIN_VOLUME_24H = 3000000       # الحد الأدنى للسيولة (3 مليون دولار)
+# ======================== 2. الحسابات الفنية (بدون pandas_ta) ========================
 
-# ======================== 3. منطق التحليل والاستراتيجية ========================
-
-async def is_market_safe():
-    """فلتر البيتكوين: يسمح بالعمل إذا كان صعود BTC أقل من 2.5%"""
-    try:
-        btc = await EXCHANGE.fetch_ticker('BTC/USDT')
-        return (btc['percentage'] or 0) < 2.5 
-    except: return True
-
-def get_targets(df):
-    """حساب الأهداف بناءً على فيبوناتشي 50%"""
-    peak = df['high'].max()
-    low = df['low'].min()
-    entry = df.iloc[-1]['close']
+def get_indicators(df):
+    """حساب RSI والبولنجر باند يدوياً"""
+    close = df['close']
     
-    target = peak - (peak - low) * 0.5 
-    stop_loss = peak * 1.015 
+    # 1. حساب البولنجر باند (20, 2)
+    sma = close.rolling(window=20).mean()
+    std = close.rolling(window=20).std()
+    upper_bb = sma + (2 * std)
+    lower_bb = sma - (2 * std)
+    bandwidth = (upper_bb - lower_bb) / sma
     
-    expected_profit = ((entry - target) / entry) * 100
-    return target, stop_loss, expected_profit
+    # 2. حساب RSI يدوياً
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    df['rsi'] = rsi
+    df['bb_width'] = bandwidth
+    df['upper_bb'] = upper_bb
+    return df
 
-def detect_reversal(df):
-    """اكتشاف شمعة الشهاب مع تأكيد الإغلاق"""
-    prev = df.iloc[-2] # شمعة الإشارة
-    last = df.iloc[-1] # شمعة التأكيد
+def detect_squeeze_and_div(df):
+    """اكتشاف الانخناق والدايفرجنس"""
+    last = df.iloc[-1]
     
-    body = abs(prev['close'] - prev['open'])
-    upper_wick = prev['high'] - max(prev['open'], prev['close'])
+    # أ- فحص انخناق البولنجر (أقل من 6%)
+    is_squeezed = last['bb_width'] < 0.06
     
-    # الشرط: ذيل علوي طويل + إغلاق تحت قاع شمعة الإشارة
-    if upper_wick > (1.5 * body) and last['close'] < prev['low']:
-        return True
-    return False
+    # ب- فحص الدايفرجنس الصعودي
+    curr_low, curr_rsi = df['low'].iloc[-1], df['rsi'].iloc[-1]
+    prev_low = df['low'].iloc[-20:-5].min()
+    prev_rsi_low = df['rsi'].iloc[-20:-5].min()
+    has_div = curr_low < prev_low and curr_rsi > prev_rsi_low
+    
+    # ج- شمعة تأكيد (ابتلاعية)
+    prev = df.iloc[-2]
+    is_engulfing = last['close'] > prev['open'] and last['open'] < prev['close'] and last['close'] > last['open']
 
-# ======================== 4. إدارة المسح والصفقات ========================
+    return is_squeezed, has_div, is_engulfing
+
+# ======================== 3. منطق التداول والمسح الدوري ========================
 
 async def scan_market():
-    global VIRTUAL_BALANCE
-    if len(portfolio["open_trades"]) >= MAX_OPEN_TRADES: return
-    if not await is_market_safe(): return
-    
+    send_telegram_msg("🔍 *بدء دورة المسح الدوري (كل 15 دقيقة)*")
     try:
         tickers = await EXCHANGE.fetch_tickers()
-        # شروط مخففة: صعود > 5% وسيولة جيدة
+        # تصفية العملات الصغير والمتوسطة (تجنب BTC/ETH والمستقرة)
         symbols = [s for s in tickers.keys() if '/USDT' in s 
-                   and (tickers[s]['percentage'] or 0) > 5.0 
-                   and (tickers[s]['quoteVolume'] or 0) > MIN_VOLUME_24H]
+                   and s not in ['BTC/USDT', 'ETH/USDT', 'USDC/USDT', 'FDUSD/USDT']]
         
-        for sym in symbols:
-            if len(portfolio["open_trades"]) >= MAX_OPEN_TRADES: break
-            if sym in portfolio["open_trades"]: continue
-            if VIRTUAL_BALANCE < TRADE_AMOUNT: continue 
+        found_signals = []
 
-            bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=40)
-            df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
-            
-            if detect_reversal(df):
-                tp, sl, profit_pct = get_targets(df)
-                
-                # شرط الربح الأدنى 3% لزيادة عدد الصفقات
-                if profit_pct >= 3.0:
-                    entry_p = df.iloc[-1]['close']
-                    VIRTUAL_BALANCE -= TRADE_AMOUNT
-                    portfolio["open_trades"][sym] = {
-                        "entry_price": entry_p,
-                        "target": tp,
-                        "stop_loss": sl,
-                        "trailing_sl": sl,
-                        "amount": TRADE_AMOUNT,
-                        "entry_time": datetime.now(),
-                        "trailing_active": False
-                    }
-                    
-                    msg = (f"⚡ *إشارة دخول (SHORT)*\n"
-                           f"🎫 العملة: {sym}\n"
-                           f"💰 السعر: {entry_p:.6f}\n"
-                           f"🎯 الهدف: {tp:.6f}\n"
-                           f"📉 ربح متوقع: {profit_pct:.2f}%\n"
-                           f"📦 المراكز: {len(portfolio['open_trades'])}/{MAX_OPEN_TRADES}")
-                    send_telegram_msg(msg)
-    except: pass
-
-async def manage_trades():
-    global VIRTUAL_BALANCE
-    while True:
-        for sym in list(portfolio["open_trades"].keys()):
+        for sym in symbols[:300]: # فحص أول 300 عملة لتوفير الوقت
             try:
-                trade = portfolio["open_trades"][sym]
-                ticker = await EXCHANGE.fetch_ticker(sym)
-                cp = ticker['last']
+                bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=50)
+                df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
+                df = get_indicators(df)
                 
-                pnl_ratio = (trade['entry_price'] - cp) / trade['entry_price']
-                pnl_pct = pnl_ratio * 100
-                duration = datetime.now() - trade['entry_time']
+                squeezed, div, confirm = detect_squeeze_and_div(df)
                 
-                # --- تفعيل وتحديث التتبع السعري ---
-                if pnl_pct >= 1.5: trade["trailing_active"] = True
-                if trade["trailing_active"]:
-                    new_sl = cp * 1.012 # ملاحقة السعر بمسافة 1.2%
-                    if new_sl < trade["trailing_sl"]:
-                        trade["trailing_sl"] = new_sl
-
-                # --- شروط الخروج ---
-                reason = None
-                if cp <= trade['target']: reason = "🎯 تم تحقيق الهدف"
-                elif cp >= trade['trailing_sl']: reason = "🛡️ خروج (تتبع/وقف)"
-                elif duration > timedelta(hours=4): reason = "⏰ خروج زمني (4س)"
+                # ترتيب القوة (نقاط)
+                score = 0
+                if squeezed: score += 50
+                if div: score += 30
+                if confirm: score += 20
                 
-                if reason:
-                    VIRTUAL_BALANCE += trade['amount'] * (1 + pnl_ratio)
-                    closed_trades_history.append({"sym": sym, "pnl": pnl_pct, "time": datetime.now()})
-                    icon = "✅" if pnl_pct > 0 else "❌"
-                    send_telegram_msg(f"🏁 *إغلاق صفقة*\n🎫 {sym}\n📊 النتيجة: {icon} {pnl_pct:+.2f}%\n💵 الرصيد: ${VIRTUAL_BALANCE:.2f}")
-                    del portfolio["open_trades"][sym]
+                if score >= 70:
+                    found_signals.append({
+                        'sym': sym, 
+                        'price': df.iloc[-1]['close'], 
+                        'score': score,
+                        'width': df.iloc[-1]['bb_width'] * 100
+                    })
             except: continue
-        await asyncio.sleep(15) # مراقبة السعر كل 15 ثانية
+            await asyncio.sleep(0.05) # حماية API
 
-# ======================== 5. نظام التقارير الدورية ========================
+        # إرسال أفضل 10 فرص
+        if found_signals:
+            top_10 = sorted(found_signals, key=lambda x: x['score'], reverse=True)[:10]
+            report = "🚀 *أفضل 10 فرص (بداية صعود):*\n\n"
+            for sig in top_10:
+                report += f"• `{sig['sym']}` | قوة: {sig['score']} | ضيق: {sig['width']:.1f}%\n"
+            send_telegram_msg(report)
+        else:
+            send_telegram_msg("⚠️ لم يتم العثور على انفجارات وشيكة حالياً.")
 
-async def hourly_report():
-    while True:
-        await asyncio.sleep(3600)
-        open_list = "".join([f"• {s}: {( (t['entry_price'] - (await EXCHANGE.fetch_ticker(s))['last']) / t['entry_price'] * 100):+.2f}%\n" for s, t in portfolio["open_trades"].items()])
-        msg = (f"📊 *التقرير الساعي*\n"
-               f"💰 الرصيد الحالي: ${VIRTUAL_BALANCE:.2f}\n"
-               f"📦 الصفقات المفتوحة:\n{open_list if open_list else 'لا يوجد'}")
-        send_telegram_msg(msg)
+    except Exception as e:
+        print(f"Error: {e}")
 
-async def daily_report():
-    global START_DAY_BALANCE
-    while True:
-        await asyncio.sleep(86400)
-        day_trades = [t for t in closed_trades_history if t['time'] > (datetime.now() - timedelta(days=1))]
-        if day_trades:
-            wins = len([t for t in day_trades if t['pnl'] > 0])
-            msg = (f"📅 *التقرير اليومي*\n"
-                   f"💰 الرصيد: ${VIRTUAL_BALANCE:.2f}\n"
-                   f"📈 النمو: ${VIRTUAL_BALANCE - START_DAY_BALANCE:+.2f}\n"
-                   f"🏆 نسبة النجاح: {(wins/len(day_trades)*100):.1f}%")
-            send_telegram_msg(msg)
-            START_DAY_BALANCE = VIRTUAL_BALANCE
-
-# ======================== 6. الوظائف العامة والتشغيل ========================
+# ======================== 4. الوظائف العامة والتشغيل ========================
 
 def send_telegram_msg(msg):
     for chat_id in DESTINATIONS:
@@ -185,18 +126,12 @@ def send_telegram_msg(msg):
         except: pass
 
 async def main_loop():
-    send_telegram_msg("🚀 *تم بدء التشغيل بالنسخة المكثفة*\nالبوت يبحث عن صعود > 5% وأهداف > 3%.")
     while True:
         await scan_market()
-        await asyncio.sleep(60)
+        await asyncio.sleep(900) # الانتظار 15 دقيقة (15 * 60)
 
 if __name__ == "__main__":
-    # تشغيل Flask في خيط منفصل لفتح البورت
     threading.Thread(target=run_flask, daemon=True).start()
     
-    # تشغيل مهام البوت الأساسية
     loop = asyncio.get_event_loop()
-    loop.create_task(manage_trades())
-    loop.create_task(hourly_report())
-    loop.create_task(daily_report())
     loop.run_until_complete(main_loop())
