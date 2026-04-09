@@ -1,23 +1,4 @@
-Aucun élément sélectionné
 
-Aller au contenu
-Utiliser Gmail avec un lecteur d'écran
-Activez les notifications sur le bureau pour Gmail.
-   OK  Non, merci
-16 sur 140
-(aucun objet)
-Boîte de réception
-
-elabed elabed
-Pièces jointes
-mer. 8 avr. 06:32 (il y a 1 jour)
-À lyceemba, mouuldi204, moi
-
-Traduit : anglais 
-français
-Vérifiez les traductions, car Traduction peut faire des erreurs
- Une pièce jointe
-  •  Analysé par Gmail
 import os
 import requests
 import ccxt
