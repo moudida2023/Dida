@@ -6,14 +6,14 @@ import os
 import threading
 import numpy as np
 from flask import Flask
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ======================== 1. إعدادات السيرفر والتلجرام ========================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "🚀 Crypto Squeeze & Divergence Bot is Active"
+    return "🚀 Snowball Elite Radar | Top 5 Mode Active"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -23,115 +23,115 @@ TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# ======================== 2. الحسابات الفنية (بدون pandas_ta) ========================
+# ======================== 2. محرك التحليل الفني (بدون مكتبات خارجية) ========================
 
-def get_indicators(df):
-    """حساب RSI والبولنجر باند يدوياً"""
+def calculate_metrics(df):
+    """حساب المقاييس الفنية بدقة عالية"""
     close = df['close']
+    high = df['high']
+    low = df['low']
+    vol = df['vol']
     
-    # 1. حساب البولنجر باند (20, 2)
-    sma = close.rolling(window=20).mean()
-    std = close.rolling(window=20).std()
-    upper_bb = sma + (2 * std)
-    lower_bb = sma - (2 * std)
-    bandwidth = (upper_bb - lower_bb) / sma
+    # حساب الانخناق (Squeeze)
+    sma = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    df['width'] = (4 * std) / sma # عرض البولنجر
     
-    # 2. حساب RSI يدوياً
+    # حساب RSI
     delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df['rsi'] = 100 - (100 / (1 + (gain / loss)))
     
-    df['rsi'] = rsi
-    df['bb_width'] = bandwidth
-    df['upper_bb'] = upper_bb
+    # حساب تدفق الأموال (MFI)
+    tp = (high + low + close) / 3
+    mf = tp * vol
+    pos_f = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg_f = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    df['mfi'] = 100 - (100 / (1 + (pos_f / neg_f)))
+    
+    # السيولة النسبية (Relative Volume)
+    df['rel_vol'] = vol / vol.rolling(24).mean()
+    
     return df
 
-def detect_squeeze_and_div(df):
-    """اكتشاف الانخناق والدايفرجنس"""
+def evaluate_opportunity(df):
+    """تقييم الفرصة بناءً على تلاقي المؤشرات"""
     last = df.iloc[-1]
+    score = 0
     
-    # أ- فحص انخناق البولنجر (أقل من 6%)
-    is_squeezed = last['bb_width'] < 0.06
+    # 1. قوة الانخناق (كلما ضاق النطاق زادت النقاط)
+    if last['width'] < 0.04: score += 45
+    elif last['width'] < 0.06: score += 25
     
-    # ب- فحص الدايفرجنس الصعودي
-    curr_low, curr_rsi = df['low'].iloc[-1], df['rsi'].iloc[-1]
-    prev_low = df['low'].iloc[-20:-5].min()
-    prev_rsi_low = df['rsi'].iloc[-20:-5].min()
-    has_div = curr_low < prev_low and curr_rsi > prev_rsi_low
+    # 2. قوة السيولة الداخلة (MFI + Rel Vol)
+    if last['mfi'] > 60: score += 30
+    if last['rel_vol'] > 2.0: score += 25
     
-    # ج- شمعة تأكيد (ابتلاعية)
-    prev = df.iloc[-2]
-    is_engulfing = last['close'] > prev['open'] and last['open'] < prev['close'] and last['close'] > last['open']
+    # 3. فلتر الأمان (تجنب العملات المتضخمة جداً)
+    if last['rsi'] > 75: score -= 40 
+    
+    return score
 
-    return is_squeezed, has_div, is_engulfing
+# ======================== 3. إدارة المسح الدوري (كل 15 دقيقة) ========================
 
-# ======================== 3. منطق التداول والمسح الدوري ========================
+async def start_radar():
+    while True:
+        try:
+            print(f"🔄 جاري المسح الشامل: {datetime.now().strftime('%H:%M')}")
+            tickers = await EXCHANGE.fetch_tickers()
+            # تصفية أزواج USDT في السبوت
+            symbols = [s for s in tickers.keys() if '/USDT' in s 
+                       and s not in ['BTC/USDT', 'ETH/USDT', 'USDC/USDT', 'FDUSD/USDT', 'BNB/USDT']]
+            
+            all_opportunities = []
 
-async def scan_market():
-    send_telegram_msg("🔍 *بدء دورة المسح الدوري (كل 15 دقيقة)*")
-    try:
-        tickers = await EXCHANGE.fetch_tickers()
-        # تصفية العملات الصغير والمتوسطة (تجنب BTC/ETH والمستقرة)
-        symbols = [s for s in tickers.keys() if '/USDT' in s 
-                   and s not in ['BTC/USDT', 'ETH/USDT', 'USDC/USDT', 'FDUSD/USDT']]
+            for sym in symbols[:350]: # فحص أكثر 350 عملة نشاطاً
+                try:
+                    bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=50)
+                    df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
+                    df = calculate_metrics(df)
+                    score = evaluate_opportunity(df)
+                    
+                    if score > 50:
+                        all_opportunities.append({
+                            'symbol': sym,
+                            'score': score,
+                            'price': df.iloc[-1]['close'],
+                            'vol_spike': round(df.iloc[-1]['rel_vol'], 1),
+                            'mfi': round(df.iloc[-1]['mfi'], 1)
+                        })
+                except: continue
+                await asyncio.sleep(0.01)
+
+            # فرز واختيار أفضل 5 عملات فقط
+            top_5 = sorted(all_opportunities, key=lambda x: x['score'], reverse=True)[:5]
+
+            if top_5:
+                message = f"🌟 *أفضل 5 فرص انفجار (Spot)*\n"
+                message += f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                for i, coin in enumerate(top_5, 1):
+                    message += (f"{i}. 🔥 *{coin['symbol']}*\n"
+                                f"   ∟ القوة: `{coin['score']}/100`\n"
+                                f"   ∟ السيولة: `{coin['vol_spike']}x` | MFI: `{coin['mfi']}`\n"
+                                f"   ∟ السعر: `{coin['price']:.6f}`\n\n")
+                send_msg(message)
+            else:
+                print("No strong signals found this cycle.")
+
+        except Exception as e:
+            print(f"Radar Error: {e}")
         
-        found_signals = []
+        await asyncio.sleep(900) # انتظار 15 دقيقة
 
-        for sym in symbols[:300]: # فحص أول 300 عملة لتوفير الوقت
-            try:
-                bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=50)
-                df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
-                df = get_indicators(df)
-                
-                squeezed, div, confirm = detect_squeeze_and_div(df)
-                
-                # ترتيب القوة (نقاط)
-                score = 0
-                if squeezed: score += 50
-                if div: score += 30
-                if confirm: score += 20
-                
-                if score >= 70:
-                    found_signals.append({
-                        'sym': sym, 
-                        'price': df.iloc[-1]['close'], 
-                        'score': score,
-                        'width': df.iloc[-1]['bb_width'] * 100
-                    })
-            except: continue
-            await asyncio.sleep(0.05) # حماية API
-
-        # إرسال أفضل 10 فرص
-        if found_signals:
-            top_10 = sorted(found_signals, key=lambda x: x['score'], reverse=True)[:10]
-            report = "🚀 *أفضل 10 فرص (بداية صعود):*\n\n"
-            for sig in top_10:
-                report += f"• `{sig['sym']}` | قوة: {sig['score']} | ضيق: {sig['width']:.1f}%\n"
-            send_telegram_msg(report)
-        else:
-            send_telegram_msg("⚠️ لم يتم العثور على انفجارات وشيكة حالياً.")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-# ======================== 4. الوظائف العامة والتشغيل ========================
-
-def send_telegram_msg(msg):
-    for chat_id in DESTINATIONS:
+def send_msg(text):
+    for cid in DESTINATIONS:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+            requests.post(url, json={"chat_id": cid, "text": text, "parse_mode": "Markdown"}, timeout=5)
         except: pass
-
-async def main_loop():
-    while True:
-        await scan_market()
-        await asyncio.sleep(900) # الانتظار 15 دقيقة (15 * 60)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(main_loop())
+    loop.run_until_complete(start_radar())
