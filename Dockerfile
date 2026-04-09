@@ -1,4 +1,14 @@
+Aucun élément sélectionné 
 
+Aller au contenu
+Utiliser Gmail avec un lecteur d'écran
+Activez les notifications sur le bureau pour Gmail.
+   OK  Non, merci
+Conversations
+63 % sur 15 Go utilisés
+Conditions d'utilisation · Confidentialité · Règlement du programme
+Dernière activité sur le compte : il y a 2 heures
+Détails
 # 1. استخدام نسخة خفيفة ومستقرة من بايثون
 FROM python:3.10-slim
 
@@ -25,3 +35,6 @@ EXPOSE 10000
 
 # 8. أمر التشغيل النهائي للبوت
 CMD ["python", "app.py"]
+
+Dockerfile (2).txt
+Affichage de dockerignore (2).txt en cours...
