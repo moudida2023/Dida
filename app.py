@@ -14,20 +14,19 @@ DB_FILE = "/tmp/database.json"
 
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 MAX_OPEN_TRADES = 20
-STRICT_SCORE = 85      # السكور المطلوب للنخبة
-INVESTMENT = 10.0      # مبلغ الاستثمار لكل صفقة
+ENTRY_SCORE = 60       # تم التعديل لـ 60 للتجربة
+INVESTMENT = 10.0      
 
 data_lock = threading.Lock()
 
 class PersistentState:
     def __init__(self):
-        # قائمة العملات التي سكورها > 85
         self.high_score_list = [] 
         self.total_scanned = 0
         self.last_sync = "بدء..."
-        self.last_db_fill = "جاري المراقبة..."
+        self.last_db_fill = "جاري الانتظار..."
         
-        # محاولة تحميل البيانات السابقة
+        # محاولة تحميل البيانات الموجودة مسبقاً
         self.load_from_disk()
 
     def load_from_disk(self):
@@ -38,33 +37,37 @@ class PersistentState:
                     if isinstance(data, list): self.high_score_list = data
         except: pass
 
-    # الدالة الأساسية لنقل المعطيات إلى قاعدة البيانات
+    # دالة ترحيل البيانات إلى ملف JSON
     def remplir_DB(self):
         with data_lock:
             try:
                 with open(DB_FILE, 'w') as f:
                     json.dump(self.high_score_list, f, indent=4)
                 self.last_db_fill = datetime.now().strftime('%H:%M:%S')
-                print(f"✅ [ترحيل النخبة] تم حفظ {len(self.high_score_list)} صفقة بسكور 85+")
+                print(f"💾 [remplir_DB] تم الترحيل في التوقيت: {self.last_db_fill}")
             except Exception as e:
                 print(f"❌ خطأ ترحيل: {e}")
 
 state = PersistentState()
 
-# ======================== 2. محرك الصيد والتحليل ========================
+# ======================== 2. خيط الترحيل الدوري (كل دقيقة) ========================
 
-async def get_strict_score(sym):
+def scheduled_filler():
+    """دالة تقوم بالترحيل الإجباري كل 60 ثانية"""
+    while True:
+        time.sleep(60)
+        state.remplir_DB()
+
+# ======================== 3. محرك الصيد السريع (100 عملة) ========================
+
+async def get_score(sym):
     try:
-        # جلب بيانات OHLCV لتحليل السيولة والسعر
-        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=30)
+        # فحص سريع لآخر 10 شمعات فقط
+        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=10)
         df = pd.DataFrame(bars, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
-        
         score = 0
-        # شرط 1: صعود قوي (أعلى من متوسط آخر 5 شمعات)
-        if df['c'].iloc[-1] > df['c'].iloc[-5:].mean(): score += 40
-        # شرط 2: انفجار حجم التداول (Volume Spike)
-        if df['v'].iloc[-1] > df['v'].mean() * 2: score += 50
-        
+        if df['c'].iloc[-1] > df['o'].iloc[-1]: score += 30 # شمعة خضراء
+        if df['v'].iloc[-1] > df['v'].mean(): score += 30   # حجم جيد
         return score, df['c'].iloc[-1]
     except: return 0, 0
 
@@ -72,44 +75,39 @@ async def main_engine():
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
-            symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
+            # جلب أول 100 عملة USDT فقط للتجربة السريعة
+            all_symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
+            symbols = all_symbols[:100] 
             
             for sym in symbols:
                 with data_lock: state.total_scanned += 1
-                
-                # جلب السكور بناءً على الشروط الصارمة
-                score, price = await get_strict_score(sym)
+                score, price = await get_score(sym)
                 
                 with data_lock:
-                    # تحديث أسعار الصفقات الموجودة مسبقاً في القائمة
+                    # تحديث أسعار الصفقات الحالية
                     for tr in state.high_score_list:
                         if tr['sym'] == sym: tr['current_price'] = price
 
-                    # الفلترة: فقط العملات التي سكورها أكثر من 85
-                    if score >= STRICT_SCORE and len(state.high_score_list) < MAX_OPEN_TRADES:
+                    # الصيد بسكور 60+
+                    if score >= ENTRY_SCORE and len(state.high_score_list) < MAX_OPEN_TRADES:
                         if not any(t['sym'] == sym for t in state.high_score_list):
-                            new_entry = {
-                                'sym': sym, 
-                                'score': score, 
-                                'entry_price': price, 
-                                'current_price': price,
-                                'investment': INVESTMENT,
+                            state.high_score_list.append({
+                                'sym': sym, 'score': score, 
+                                'entry_price': price, 'current_price': price,
                                 'time': datetime.now().strftime('%H:%M:%S')
-                            }
-                            # الإضافة للقائمة
-                            state.high_score_list.append(new_entry)
-                            # ترحيل فوري لقاعدة البيانات عند الصيد
+                            })
+                            # حفظ فوري عند الصيد لضمان المزامنة
                             state.remplir_DB()
                 
                 await asyncio.sleep(0.01)
             
-            with data_lock: state.last_sync = datetime.now().strftime('%H:%M:%S')
-            # ترحيل دوري في نهاية كل دورة مسح أيضاً
-            state.remplir_DB()
-            await asyncio.sleep(10)
+            with data_lock: 
+                state.last_sync = datetime.now().strftime('%H:%M:%S')
+                state.total_scanned = 0 # تصفير العداد لبدء دورة جديدة
+            await asyncio.sleep(5)
         except: await asyncio.sleep(10)
 
-# ======================== 3. واجهة الموقع ========================
+# ======================== 4. واجهة العرض ========================
 
 @app.route('/')
 def home():
@@ -117,23 +115,22 @@ def home():
         active = list(state.high_score_list)
         last_fill = state.last_db_fill
     
-    rows = "".join([f"<tr style='border-bottom:1px solid #2b3139;'><td>{t['time']}</td><td><b style='color:#f0b90b;'>{t['sym']}</b></td><td style='color:#00ff00;'>{t['score']}</td><td>{t['current_price']:.4f}</td><td>${t['investment']}</td></tr>" for t in reversed(active)])
+    rows = "".join([f"<tr style='border-bottom:1px solid #2b3139;'><td>{t['time']}</td><td><b>{t['sym']}</b></td><td style='color:#00ff00;'>{t['score']}</td><td>{t['current_price']:.4f}</td></tr>" for t in reversed(active)])
 
-    return f"""<html><head><meta http-equiv="refresh" content="15"></head>
+    return f"""<html><head><meta http-equiv="refresh" content="10"></head>
     <body style="background:#0b0e11; color:white; font-family:sans-serif; padding:20px;">
-        <div style="max-width:900px; margin:auto; background:#1e2329; padding:25px; border-radius:15px; border:1px solid #363a45;">
-            <h2 style="color:#f0b90b; margin:0;">💎 رادار النخبة (Score 85+)</h2>
-            <p style="color:#848e9c; font-size:0.9em;">آخر ترحيل لملف JSON: <span style="color:#00ff00;">{last_fill}</span></p>
-            
-            <table style="width:100%; text-align:center; border-collapse:collapse; margin-top:20px;">
-                <thead style="background:#2b3139; color:#848e9c;">
-                    <tr><th>الوقت</th><th>العملة</th><th>السكور</th><th>السعر</th><th>الاستثمار</th></tr>
-                </thead>
-                <tbody>{rows if rows else "<tr><td colspan='5' style='padding:30px; color:#444;'>انتظار عملات تحقق شروط النخبة (85+)...</td></tr>"}</tbody>
+        <div style="max-width:800px; margin:auto; background:#1e2329; padding:20px; border-radius:12px;">
+            <h2 style="color:#f0b90b;">🧪 نسخة التجربة السريعة (v64)</h2>
+            <div style="background:#2b3139; padding:10px; border-radius:5px; margin-bottom:15px; border-left:5px solid #f0b90b;">
+                <p style="margin:0;">📉 السكور المطلوب: <b>60</b> | 🎯 العملات المفحوصة: <b>أول 100</b></p>
+                <p style="margin-top:5px; color:#00ff00;">🔄 توقيت آخر ترحيل آلي (كل دقيقة): <b>{last_fill}</b></p>
+            </div>
+            <table style="width:100%; text-align:center; border-collapse:collapse;">
+                <thead><tr style="color:#848e9c;"><th>الوقت</th><th>العملة</th><th>السكور</th><th>السعر</th></tr></thead>
+                <tbody>{rows if rows else "<tr><td colspan='4'>جاري فحص الـ 100 عملة...</td></tr>"}</tbody>
             </table>
-            
             <div style="margin-top:20px; text-align:center;">
-                <a href="/database" target="_blank" style="color:#f0b90b; text-decoration:none; font-size:0.8em;">🔗 فتح قاعدة البيانات (JSON)</a>
+                <a href="/database" target="_blank" style="color:#f0b90b;">📂 فتح قاعدة البيانات الخام</a>
             </div>
         </div></body></html>"""
 
@@ -143,6 +140,8 @@ def view_db():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    # تشغيل خيط الترحيل الدوري
+    threading.Thread(target=scheduled_filler, daemon=True).start()
     # تشغيل الموقع والمحرك
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
     asyncio.get_event_loop().run_until_complete(main_engine())
