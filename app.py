@@ -9,7 +9,7 @@ import requests
 from flask import Flask, render_template_string, redirect, url_for
 from datetime import datetime, timedelta
 
-# ======================== 1. الإعدادات والربط ========================
+# ======================== 1. الإعدادات الرقمية الجديدة ========================
 app = Flask(__name__)
 
 DB_URL = os.environ.get('DATABASE_URL')
@@ -21,9 +21,12 @@ TELEGRAM_CHAT_ID = '5067771509'
 
 INITIAL_BALANCE = 1000.0
 MAX_OPEN_TRADES = 20
-TAKE_PROFIT_PCT = 0.05
-STOP_LOSS_PCT = -0.05
-TRAILING_ACTIVATE = 0.02
+
+# التعديلات المطلوبة:
+ENTRY_SCORE_THRESHOLD = 80   # الدخول عند سكور 80
+TAKE_PROFIT_PCT = 0.03       # جني الأرباح عند 3%
+STOP_LOSS_PCT = -0.03        # وقف الخسارة عند -3%
+TRAILING_ACTIVATE = 0.015    # تفعيل التتبع عند ربح 1.5% (نصف الهدف)
 
 MIN_VOLUME_24H = 1000000
 EXCLUDED_COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
@@ -49,7 +52,7 @@ def init_db():
         cur.close(); conn.close()
     except Exception as e: print(f"DB Error: {e}")
 
-# ======================== 2. محرك التحليل ========================
+# ======================== 2. محرك التحليل وفلتر السوق ========================
 
 async def is_market_safe(exchange_instance):
     try:
@@ -78,7 +81,7 @@ async def perform_analysis(sym, exchange_instance):
         return int(score), close.iloc[-1]
     except: return 0, 0
 
-# ======================== 3. المحرك الرئيسي ========================
+# ======================== 3. المحرك التشغيلي ========================
 
 async def main_engine():
     init_db()
@@ -93,7 +96,7 @@ async def main_engine():
             if market_safe:
                 for sym in sorted(valid_symbols, key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:60]:
                     score, _ = await perform_analysis(sym, EXCHANGE)
-                    if score >= 85: 
+                    if score >= ENTRY_SCORE_THRESHOLD: # استخدام السكور الجديد 80
                         scored_candidates.append({'symbol': sym, 'score': score, 'price': tickers[sym]['last']})
                     await asyncio.sleep(0.01)
 
@@ -106,12 +109,12 @@ async def main_engine():
                 if cur.fetchone()[0] == 0:
                     cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
                     if cur.fetchone()[0] < MAX_OPEN_TRADES:
-                        # توزيع مخاطر: 75$ للسكور العالي جداً، و50$ للسكور الجيد
-                        amt = 75.0 if best['score'] >= 95 else 50.0
-                        tp = best['price'] * (1 + TAKE_PROFIT_PCT); sl = best['price'] * (1 + STOP_LOSS_PCT)
+                        amt = 75.0 if best['score'] >= 90 else 50.0
+                        tp = best['price'] * (1 + TAKE_PROFIT_PCT)
+                        sl = best['price'] * (1 + STOP_LOSS_PCT)
                         cur.execute("INSERT INTO trades (symbol, entry_price, current_price, take_profit, stop_loss, investment, status, score, open_time, date_added) VALUES (%s, %s, %s, %s, %s, %s, 'OPEN', %s, %s, %s)", 
                                    (best['symbol'], best['price'], best['price'], tp, sl, amt, best['score'], datetime.now().strftime('%H:%M:%S'), datetime.now().date()))
-                        send_telegram_msg(f"🚀 *دخول:* {best['symbol']} | المبلغ: `${amt}`")
+                        send_telegram_msg(f"✅ *دخول (سكور {best['score']}):* {best['symbol']}\nالهدف: `+3%` | الوقف: `-3%`")
 
             cur.execute("SELECT * FROM trades WHERE status = 'OPEN'")
             for ot in cur.fetchall():
@@ -124,7 +127,8 @@ async def main_engine():
                 
                 if cp <= new_sl or cp >= ot['take_profit']:
                     cur.execute("UPDATE trades SET exit_price=%s, status='CLOSED', close_time=%s WHERE symbol=%s", (cp, datetime.now().strftime('%H:%M:%S'), sym))
-                    send_telegram_msg(f"🏁 *إغلاق:* {sym} ({pnl*100:+.2f}%)")
+                    msg = "💰 ربح 3%" if cp >= ot['take_profit'] else "❌ وقف خسارة 3%"
+                    send_telegram_msg(f"{msg}: {sym}")
                 else:
                     cur.execute("UPDATE trades SET current_price=%s, stop_loss=%s WHERE symbol=%s", (cp, new_sl, sym))
 
@@ -132,7 +136,7 @@ async def main_engine():
             await asyncio.sleep(20)
         except: await asyncio.sleep(15)
 
-# ======================== 4. الموقع (مع إضافة عمود المبلغ) ========================
+# ======================== 4. واجهة الموقع ========================
 
 @app.route('/')
 def index():
@@ -148,42 +152,31 @@ def index():
 
     html = """
     <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
-    <title>Master Bot v138</title><style>
+    <title>Master Bot v139</title><style>
     body { background: #0b0e11; color: white; font-family: sans-serif; padding: 20px; direction: rtl; }
-    .stats { display: flex; gap: 15px; margin-bottom: 20px; }
-    .card { background: #1e2329; padding: 15px; border-radius: 8px; flex: 1; text-align: center; border-top: 4px solid #f0b90b; }
+    .card { background: #1e2329; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-top: 4px solid #f0b90b; display: inline-block; min-width: 200px; text-align: center; }
     table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 8px; }
     th, td { padding: 12px; text-align: center; border-bottom: 1px solid #2b3139; }
     .profit { color: #0ecb81; } .loss { color: #f6465d; }
     .btn-close { background: #f6465d; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 11px; }
     </style></head><body>
-    <h1>🛰️ لوحة التحكم المركزية</h1>
-    <div class="stats">
-        <div class="card"><h3>الرصيد الكلي</h3><p>${{ "%.2f"|format(total) }}</p></div>
-        <div class="card"><h3>أرباح محققة</h3><p class="profit">${{ "%.2f"|format(realized) }}</p></div>
-    </div>
-    <table><tr>
-        <th>العملة</th>
-        <th>مبلغ الدخول</th> <th>سعر الدخول</th>
-        <th>السعر الحالي</th>
-        <th>الربح %</th>
-        <th>السكور</th>
-        <th>الإجراء</th>
-    </tr>
+    <h1>🚀 لوحة التحكم (سكور 80 | 3%)</h1>
+    <div class="card"><h3>الرصيد الكلي</h3><p>${{ "%.2f"|format(total) }}</p></div>
+    <table><tr><th>العملة</th><th>المبلغ</th><th>الحالي</th><th>الربح %</th><th>السكور</th><th>الإجراء</th></tr>
     {% for t in opens %}
     <tr>
         <td><b>{{ t.symbol }}</b></td>
-        <td><b>${{ t.investment }}</b></td> <td>{{ "%.4f"|format(t.entry_price) }}</td>
+        <td>${{ t.investment }}</td>
         <td>{{ "%.4f"|format(t.current_price) }}</td>
         <td class="{{ 'profit' if t.current_price >= t.entry_price else 'loss' }}">
             {{ "%+.2f"|format(((t.current_price-t.entry_price)/t.entry_price)*100) }}%
         </td>
         <td>{{ t.score }}</td>
-        <td><a href="/close/{{ t.symbol }}" class="btn-close" onclick="return confirm('إغلاق يدوي؟')">إغلاق</a></td>
+        <td><a href="/close/{{ t.symbol }}" class="btn-close">إغلاق</a></td>
     </tr>
     {% endfor %}</table></body></html>
     """
-    return render_template_string(html, total=total, realized=realized, opens=opens)
+    return render_template_string(html, total=total, opens=opens)
 
 @app.route('/close/<symbol>')
 def close_trade(symbol):
