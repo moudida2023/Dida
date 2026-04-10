@@ -10,61 +10,47 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# إعدادات المسارات
-CSV_PATH = "/tmp/elite_signals_v90.csv"
+# استخدام مسار ثابت ومضمون
+CSV_PATH = "/tmp/live_trading_v91.csv"
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 
-# إعدادات السكور الجديدة
-WEB_DISPLAY_LIMIT = 60      # تظهر في الموقع من سكور 60
-TELEGRAM_ALERT_LIMIT = 85   # ترسل لتليجرام من سكور 85 (طلبك الحالي)
-
 data_lock = threading.Lock()
 
-# --- دالة مزامنة البيانات ---
-def sync_trading_data(symbol, price, score, is_new=False):
+# --- دالة مزامنة البيانات (معدلة لضمان الظهور الفوري) ---
+def sync_data(symbol, price, score, is_new=False):
     headers = ['Symbol', 'Time', 'Entry', 'Current', 'Score']
     with data_lock:
         try:
+            # 1. إنشاء الملف إذا لم يكن موجوداً
             if not os.path.exists(CSV_PATH):
                 with open(CSV_PATH, 'w', newline='', encoding='utf-8') as f:
                     csv.writer(f).writerow(headers)
 
+            # 2. قراءة البيانات الحالية
             df = pd.read_csv(CSV_PATH)
             
+            # 3. إذا كانت العملة موجودة، حدث السعر والسكور
             if symbol in df['Symbol'].values:
-                # تحديث السعر والسكور في الملف باستمرار
                 df.loc[df['Symbol'] == symbol, 'Current'] = f"{price:.4f}"
                 df.loc[df['Symbol'] == symbol, 'Score'] = score
                 df.to_csv(CSV_PATH, index=False)
                 return False
+            
+            # 4. إذا كانت عملة جديدة (وسكورها يسمح)، أضفها
             elif is_new:
-                # تسجيل إشارة جديدة
-                new_row = [symbol, datetime.now().strftime('%H:%M:%S'), f"{price:.4f}", f"{price:.4f}", score]
                 with open(CSV_PATH, 'a', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerow(new_row)
+                    writer = csv.writer(f)
+                    writer.writerow([symbol, datetime.now().strftime('%H:%M:%S'), f"{price:.4f}", f"{price:.4f}", score])
                 return True
         except Exception as e:
-            print(f"Sync Error: {e}")
+            print(f"❌ خطأ في الملف: {e}")
         return False
 
-# --- وظيفة إرسال التنبيه (85+) ---
-def send_telegram_notification(sym, price, score):
-    msg = (f"🚀 *إشارة سكور مرتفع: {score}*\n\n"
-           f"💎 العملة: `{sym}`\n"
-           f"💰 الدخول: `{price:.4f}`\n"
-           f"📊 الحالة: تجاوزت حد الـ {TELEGRAM_ALERT_LIMIT}")
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-    except: pass
-
-# --- المحرك الرئيسي ---
+# --- محرك البحث المطور ---
 async def market_engine():
     exchange = ccxt.binance({'enableRateLimit': True})
-    sent_list = set() # لمنع تكرار الإرسال
-
-    print(f"📡 الرادار يعمل.. تنبيهات تليجرام مفعّلة للسكور {TELEGRAM_ALERT_LIMIT}+")
+    sent_list = set()
 
     while True:
         try:
@@ -76,63 +62,76 @@ async def market_engine():
                 price = tickers[sym].get('last', 0)
                 change = tickers[sym].get('percentage', 0)
                 
-                # حساب السكور المحدث
-                if change > 4.5: score = 95
-                elif change > 3: score = 85
-                elif change > 2: score = 75
-                elif change > 1.2: score = 60
+                # حساب السكور
+                if change > 3: score = 85
+                elif change > 1.5: score = 65
                 else: score = 0
 
-                # 1. تحديث الموقع
-                if score >= WEB_DISPLAY_LIMIT:
-                    sync_trading_data(sym, price, score, is_new=True)
-                    
-                    # 2. إرسال تليجرام إذا حقق الشرط الجديد (85)
-                    if score >= TELEGRAM_ALERT_LIMIT and sym not in sent_list:
-                        threading.Thread(target=send_telegram_notification, args=(sym, price, score)).start()
-                        sent_list.add(sym)
+                # التنفيذ بناءً على السكور
+                if score >= 60:
+                    # إضافة للملف (ستظهر في الموقع)
+                    if sync_data(sym, price, score, is_new=True):
+                        # إرسال تليجرام إذا وصل 85
+                        if score >= 85 and sym not in sent_list:
+                            threading.Thread(target=lambda: requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                                json={"chat_id": TELEGRAM_CHAT_ID, "text": f"🚀 إشارة: {sym}\n💰 السعر: {price}\n📊 السكور: {score}"}
+                            )).start()
+                            sent_list.add(sym)
                 else:
-                    sync_trading_data(sym, price, score, is_new=False)
+                    # تحديث السعر فقط إذا كانت مسجلة مسبقاً
+                    sync_data(sym, price, score, is_new=False)
 
             await asyncio.sleep(15)
         except Exception as e:
-            print(f"Scanner Error: {e}")
             await asyncio.sleep(10)
 
-# --- واجهة الموقع ---
+# --- واجهة الموقع (مصلحة لعرض البيانات فوراً) ---
 @app.route('/')
 def index():
-    if not os.path.exists(CSV_PATH):
-        return "<body style='background:#0b0e11;color:white;text-align:center;'><h2>جاري المسح.. بانتظار سكور 60+</h2></body>"
-    
-    with data_lock:
-        df = pd.read_csv(CSV_PATH)
-    
-    rows = ""
-    for _, r in df.iloc[::-1].iterrows():
-        # تمييز عملات الـ 85+ بلون ذهبي
-        style = "background:#2d2610;" if r['Score'] >= 85 else ""
-        color_p = "#00ff00" if float(r['Current']) >= float(r['Entry']) else "#ff4444"
+    try:
+        if not os.path.exists(CSV_PATH) or os.path.getsize(CSV_PATH) < 20:
+            return "<body style='background:#0b0e11;color:white;text-align:center;'><h2>🔎 جاري فحص السوق.. انتظر ظهور أول عملة</h2></body>"
         
-        rows += f"""<tr style="border-bottom:1px solid #2b3139; {style}">
-            <td style="padding:12px; color:#f0b90b;"><b>{r['Symbol']}</b></td>
-            <td>{r['Time']}</td>
-            <td>{r['Entry']}</td>
-            <td style="color:{color_p}; font-weight:bold;">{r['Current']}</td>
-            <td><span style="background:#363a45; padding:2px 10px; border-radius:10px;">{r['Score']}</span></td>
-        </tr>"""
+        with data_lock:
+            df = pd.read_csv(CSV_PATH)
+        
+        # التأكد من أن البيانات ليست فارغة
+        if df.empty:
+            return "<body style='background:#0b0e11;color:white;text-align:center;'><h2>🔎 السوق هادئ حالياً.. بانتظار حركة</h2></body>"
 
-    return f"""<html><head><meta http-equiv="refresh" content="15"></head>
-    <body style="background:#0b0e11;color:white;font-family:sans-serif;text-align:center;padding:20px;">
-        <h2 style="color:#f0b90b;">🚀 رادار الصفقات v90 (Score 85+)</h2>
-        <table style="width:95%; margin:auto; background:#1e2329; border-collapse:collapse; border-radius:10px; overflow:hidden;">
-            <thead style="background:#2b3139; color:#848e9c;">
-                <tr><th>الرمز</th><th>وقت الرصد</th><th>سعر الدخول</th><th>السعر الحالي</th><th>السكور</th></tr>
-            </thead>
-            <tbody>{rows}</tbody>
-        </table>
-    </body></html>"""
+        rows = ""
+        # عرض آخر 20 عملة (الأحدث بالأعلى)
+        for _, r in df.iloc[::-1].head(20).iterrows():
+            entry_p = float(r['Entry'])
+            curr_p = float(r['Current'])
+            color_p = "#00ff00" if curr_p >= entry_p else "#ff4444"
+            
+            rows += f"""<tr style="border-bottom:1px solid #2b3139;">
+                <td style="padding:12px; color:#f0b90b;"><b>{r['Symbol']}</b></td>
+                <td style="color:#848e9c;">{r['Time']}</td>
+                <td>{entry_p:.4f}</td>
+                <td style="color:{color_p}; font-weight:bold;">{curr_p:.4f}</td>
+                <td><span style="background:#363a45; padding:2px 10px; border-radius:10px;">{r['Score']}</span></td>
+            </tr>"""
+
+        return f"""<html><head><meta http-equiv="refresh" content="10">
+        <style>
+            body{{background:#0b0e11; color:white; font-family:sans-serif; text-align:center; padding:20px;}}
+            table{{width:95%; margin:auto; background:#1e2329; border-collapse:collapse; border-radius:10px; overflow:hidden;}}
+            th{{background:#2b3139; color:#848e9c; padding:15px; text-align:center;}}
+            td{{padding:10px; text-align:center;}}
+        </style></head>
+        <body>
+            <h2 style="color:#f0b90b;">📊 رادار التداول المباشر v91</h2>
+            <table>
+                <thead><tr><th>الرمز</th><th>الوقت</th><th>الدخول</th><th>الحالي</th><th>السكور</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </body></html>"""
+    except Exception as e:
+        return f"خطأ في عرض الصفحة: {e}"
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080)).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, use_reloader=False)).start()
     asyncio.get_event_loop().run_until_complete(market_engine())
