@@ -155,4 +155,47 @@ def index():
     table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 8px; }
     th, td { padding: 12px; text-align: center; border-bottom: 1px solid #2b3139; }
     .profit { color: #0ecb81; } .loss { color: #f6465d; }
-    .btn-close { background: #f6465d; color: white; border: none; padding: 5
+    .btn-close { background: #f6465d; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; text-decoration: none; font-size: 11px; }
+    </style></head><body>
+    <h1>🛰️ لوحة التحكم المركزية</h1>
+    <div class="stats">
+        <div class="card"><h3>الرصيد الكلي</h3><p>${{ "%.2f"|format(total) }}</p></div>
+        <div class="card"><h3>أرباح محققة</h3><p class="profit">${{ "%.2f"|format(realized) }}</p></div>
+    </div>
+    <table><tr>
+        <th>العملة</th>
+        <th>مبلغ الدخول</th> <th>سعر الدخول</th>
+        <th>السعر الحالي</th>
+        <th>الربح %</th>
+        <th>السكور</th>
+        <th>الإجراء</th>
+    </tr>
+    {% for t in opens %}
+    <tr>
+        <td><b>{{ t.symbol }}</b></td>
+        <td><b>${{ t.investment }}</b></td> <td>{{ "%.4f"|format(t.entry_price) }}</td>
+        <td>{{ "%.4f"|format(t.current_price) }}</td>
+        <td class="{{ 'profit' if t.current_price >= t.entry_price else 'loss' }}">
+            {{ "%+.2f"|format(((t.current_price-t.entry_price)/t.entry_price)*100) }}%
+        </td>
+        <td>{{ t.score }}</td>
+        <td><a href="/close/{{ t.symbol }}" class="btn-close" onclick="return confirm('إغلاق يدوي؟')">إغلاق</a></td>
+    </tr>
+    {% endfor %}</table></body></html>
+    """
+    return render_template_string(html, total=total, realized=realized, opens=opens)
+
+@app.route('/close/<symbol>')
+def close_trade(symbol):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE trades SET status='CLOSED', close_time=%s WHERE symbol=%s AND status='OPEN'", (datetime.now().strftime('%H:%M:%S'), symbol))
+        conn.commit(); cur.close(); conn.close()
+    except: pass
+    return redirect(url_for('index'))
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+    asyncio.run(main_engine())
