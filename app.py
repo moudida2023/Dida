@@ -7,179 +7,109 @@ import threading
 from flask import Flask
 from datetime import datetime
 
-# ======================== 1. الإعدادات الأساسية ========================
+# ======================== 1. الإعدادات ========================
 app = Flask('')
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
+EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# إعداد المنصة مع حماية مدمجة من الحظر
-EXCHANGE = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
+# قائمة البيانات (المصدر الوحيد للحقيقة)
+GLOBAL_DATA = {
+    'history': [],      # سجل الرادار
+    'trades': {},       # الصفقات المفتوحة
+    'balance': 500.0,
+    'last_scan': "لم يبدأ بعد"
+}
 
-# قائمة العملات المستبعدة (العملات المستقرة والقيادية جداً)
-EXCLUDE_LIST = ['TUSD/USDT', 'USDC/USDT', 'FDUSD/USDT', 'USDT/USDT', 'BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+TABLE_THRESHOLD = 50
+TRADE_THRESHOLD = 85
 
-# متغيرات النظام
-OPEN_TRADES = {}     
-SEARCH_HISTORY = [] 
-CURRENT_BALANCE = 500.0
-
-# عتبات التحكم
-TABLE_SCORE_LEVEL = 50   # للظهور في الجدول
-TRADE_SCORE_LEVEL = 85   # للشراء الفعلي
-
-# ======================== 2. واجهة العرض (Dashboard) ========================
+# ======================== 2. لوحة التحكم ========================
 
 @app.route('/')
 def home():
-    # إنشاء جدول الصفقات المفتوحة
+    # بناء جدول الصفقات من GLOBAL_DATA مباشرة
     trades_rows = ""
-    for sym, data in OPEN_TRADES.items():
-        pnl = ((data['current'] - data['entry']) / data['entry']) * 100
-        color = "#00ff00" if pnl >= 0 else "#ff4444"
-        trades_rows += f"""
-        <tr>
-            <td>{sym}</td>
-            <td>{data['entry']:.6f}</td>
-            <td>{data['current']:.6f}</td>
-            <td style="color:{color}; font-weight:bold;">{pnl:+.2f}%</td>
-            <td>{data.get('score')}</td>
-        </tr>"""
+    for sym, d in GLOBAL_DATA['trades'].items():
+        pnl = ((d['current'] - d['entry']) / d['entry']) * 100
+        trades_rows += f"<tr><td>{sym}</td><td>{d['entry']:.6f}</td><td>{d['current']:.6f}</td><td style='color:{'#00ff00' if pnl>=0 else '#ff4444'};'>{pnl:+.2f}%</td></tr>"
 
-    # إنشاء جدول الرادار التاريخي (آخر 40 فرصة)
+    # بناء جدول الرادار من GLOBAL_DATA مباشرة
     history_rows = ""
-    # نسخة من السجل لتجنب أخطاء التزامن أثناء البحث
-    safe_history = list(SEARCH_HISTORY)
-    for item in reversed(safe_history[-40:]):
-        history_rows += f"""
-        <tr>
-            <td>{item['time']}</td>
-            <td><strong>{item['sym']}</strong></td>
-            <td><span style="color:#f0b90b;">{item['score']}</span></td>
-            <td>{item['price']:.6f}</td>
-        </tr>"""
+    for item in reversed(GLOBAL_DATA['history']):
+        history_rows += f"<tr><td>{item['time']}</td><td><b>{item['sym']}</b></td><td style='color:#f0b90b;'>{item['score']}</td><td>{item['price']:.6f}</td></tr>"
 
     return f"""
-    <html><head>
-        <title>Sniper Elite v17 - Final</title>
-        <meta http-equiv="refresh" content="30">
-        <style>
-            body {{ background: #0b0e11; color: #eaecef; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 20px; text-align: center; }}
-            .header {{ background: #1e2329; padding: 20px; border-bottom: 3px solid #f0b90b; border-radius: 10px; }}
-            .stats {{ display: flex; justify-content: space-around; background: #181a20; padding: 15px; margin: 20px 0; border-radius: 8px; }}
-            table {{ width: 100%; border-collapse: collapse; background: #1e2329; margin-top: 10px; border-radius: 8px; overflow: hidden; }}
-            th, td {{ padding: 12px; border: 1px solid #2b3139; text-align: center; }}
-            th {{ background: #2b3139; color: #f0b90b; }}
-            h2 {{ color: #f0b90b; border-left: 5px solid #f0b90b; padding-left: 10px; text-align: left; }}
-        </style>
-    </head>
+    <html><head><meta http-equiv="refresh" content="20">
+    <style>
+        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; text-align: center; padding: 20px; }}
+        table {{ width: 100%; border-collapse: collapse; background: #1e2329; margin-bottom: 30px; }}
+        th, td {{ padding: 12px; border: 1px solid #2b3139; text-align: center; }}
+        th {{ background: #2b3139; color: #f0b90b; }}
+        .header {{ background: #1e2329; padding: 10px; border-radius: 8px; border-bottom: 3px solid #f0b90b; }}
+    </style></head>
     <body>
-        <div class="header"><h1>🎯 Sniper Elite v17 (النسخة النهائية)</h1></div>
-        <div class="stats">
-            <div>الرصيد: <b>{CURRENT_BALANCE:.2f} USDT</b></div>
-            <div>الصفقات النشطة: <b>{len(OPEN_TRADES)}</b></div>
-            <div>العملات في الرادار: <b>{len(SEARCH_HISTORY)}</b></div>
-        </div>
+        <div class="header"><h1>🚀 Sniper Dashboard v18</h1>
+        <p>آخر فحص: {GLOBAL_DATA['last_scan']} | الرصيد: {GLOBAL_DATA['balance']:.2f} | الرادار: {len(GLOBAL_DATA['history'])}</p></div>
         
-        <h2>💎 الصفقات الحالية</h2>
-        <table>
-            <thead><tr><th>العملة</th><th>سعر الدخول</th><th>السعر الحالي</th><th>الربح/الخسارة</th><th>السكور</th></tr></thead>
-            <tbody>{trades_rows if trades_rows else "<tr><td colspan='5'>لا توجد صفقات مفتوحة حالياً</td></tr>"}</tbody>
-        </table>
+        <h3>💎 صفقات التلجرام النشطة</h3>
+        <table><thead><tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>PNL%</th></tr></thead>
+        <tbody>{trades_rows if trades_rows else "<tr><td colspan='4'>بانتظار إشارة تلجرام...</td></tr>"}</tbody></table>
 
-        <h2>🏆 رادار الفرص المكتشفة (سكور {TABLE_SCORE_LEVEL}+)</h2>
-        <table>
-            <thead><tr><th>الوقت</th><th>العملة</th><th>السكور الفني</th><th>سعر الرصد</th></tr></thead>
-            <tbody>{history_rows if history_rows else "<tr><td colspan='4'>جاري مسح السوق... انتظر قليلاً</td></tr>"}</tbody>
-        </table>
+        <h3>🏆 سجل رادار الاكتشاف</h3>
+        <table><thead><tr><th>الوقت</th><th>العملة</th><th>السكور</th><th>السعر</th></tr></thead>
+        <tbody>{history_rows if history_rows else "<tr><td colspan='4'>البوت يبحث الآن...</td></tr>"}</tbody></table>
     </body></html>"""
 
-# ======================== 3. محرك التحليل والبحث ========================
+# ======================== 3. المحرك الفني ========================
 
-async def calculate_score(sym):
+async def analyze_coin(sym):
     try:
-        # جلب بيانات الشموع (Limit قليل لتوفير البيانات)
         bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=40)
-        if len(bars) < 30: return 0, 0
-        
         df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
         score = 0
+        if df['close'].iloc[-1] > df['close'].ewm(span=200).mean().iloc[-1]: score += 40
+        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1]: score += 30
         
-        # 1. فلتر الاتجاه (EMA 200) - 30 نقطة
-        ema = df['close'].ewm(span=200).mean().iloc[-1]
-        if df['close'].iloc[-1] > ema: score += 30
-        
-        # 2. فلتر السيولة (Volume) - 30 نقطة
-        avg_vol = df['vol'].rolling(20).mean().iloc[-1]
-        if df['vol'].iloc[-1] > avg_vol: score += 30
-        
-        # 3. فلتر القوة النسبية (RSI) - 40 نقطة
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + (gain / (loss + 1e-9)))).iloc[-1]
-        if 45 < rsi < 75: score += 40
-        
+        # RSI
+        delta = df['close'].diff(); g = delta.where(delta>0,0).rolling(14).mean(); l = -delta.where(delta<0,0).rolling(14).mean()
+        rsi = 100 - (100 / (1 + (g/(l+1e-9)))).iloc[-1]
+        if 40 < rsi < 75: score += 30
         return int(score), df['close'].iloc[-1]
-    except:
-        return 0, 0
+    except: return 0, 0
 
-async def main_engine():
-    global SEARCH_HISTORY, OPEN_TRADES
+async def scanner_loop():
     while True:
         try:
-            # جلب كل الأسعار بطلب واحد (توفيراً للـ Rate Limit)
             tickers = await EXCHANGE.fetch_tickers()
-            symbols = [s for s in tickers.keys() if '/USDT' in s and s not in EXCLUDE_LIST]
-            
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] بدأ فحص {len(symbols)} عملة...")
+            symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
+            GLOBAL_DATA['last_scan'] = datetime.now().strftime('%H:%M:%S')
 
             for sym in symbols:
-                score, price = await calculate_score(sym)
+                score, price = await analyze_coin(sym)
                 
-                # تحديث الجدول فورياً
-                if score >= TABLE_SCORE_LEVEL:
-                    # التحقق من عدم التكرار في آخر دورة
-                    if sym not in [x['sym'] for x in SEARCH_HISTORY[-15:]]:
-                        SEARCH_HISTORY.append({
-                            'sym': sym, 'score': score, 'price': price,
-                            'time': datetime.now().strftime('%H:%M:%S')
-                        })
-                        if len(SEARCH_HISTORY) > 60: SEARCH_HISTORY.pop(0)
+                # أي عملة تحقق السكور تضاف فوراً للرادار
+                if score >= TABLE_THRESHOLD:
+                    if sym not in [x['sym'] for x in GLOBAL_DATA['history'][-20:]]:
+                        GLOBAL_DATA['history'].append({'sym': sym, 'score': score, 'price': price, 'time': datetime.now().strftime('%H:%M:%S')})
+                        if len(GLOBAL_DATA['history']) > 50: GLOBAL_DATA['history'].pop(0)
 
-                # تنفيذ الشراء الآلي
-                if score >= TRADE_SCORE_LEVEL and sym not in OPEN_TRADES:
-                    OPEN_TRADES[sym] = {'entry': price, 'current': price, 'score': score}
-                    send_telegram(f"🚀 *إشارة دخول قوية!*\nالعملة: {sym}\nالسكور: {score}\nالسعر: {price}")
+                # أي عملة ترسل تلجرام تضاف فوراً لجدول الصفقات
+                if score >= TRADE_THRESHOLD and sym not in GLOBAL_DATA['trades']:
+                    GLOBAL_DATA['trades'][sym] = {'entry': price, 'current': price, 'score': score}
+                    send_telegram(f"🚀 *إشارة دخول!*\nالعملة: {sym}\nالسكور: {score}")
                 
-                # تأخير 0.05 ثانية بين كل عملة لحماية الـ IP من الحظر
                 await asyncio.sleep(0.05)
-
-            print("--- انتهاء المسح. راحة لمدة 5 دقائق ---")
-            await asyncio.sleep(300) 
-            
+            await asyncio.sleep(300)
         except Exception as e:
-            print(f"خطأ في المحرك: {e}")
-            await asyncio.sleep(60)
+            print(f"Error: {e}"); await asyncio.sleep(60)
 
 def send_telegram(msg):
     for cid in DESTINATIONS:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                          json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-        except:
-            pass
-
-# ======================== 4. بدء التشغيل ========================
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"})
+        except: pass
 
 if __name__ == "__main__":
-    # تشغيل سيرفر الويب
     port = int(os.environ.get("PORT", 8080))
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
-    
-    # تشغيل البوت
-    loop = asyncio.get_event_loop()
-    loop.create_task(main_engine())
-    loop.run_forever()
+    asyncio.get_event_loop().run_until_complete(scanner_loop())
