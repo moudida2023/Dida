@@ -12,18 +12,19 @@ from datetime import datetime
 # ======================== 1. الإعدادات والربط ========================
 app = Flask(__name__)
 
-# جلب رابط قاعدة البيانات
 DB_URL = os.environ.get('DATABASE_URL')
-
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 
-INITIAL_BALANCE = 500.0
-TRADE_AMOUNT = 50.0
-MAX_OPEN_TRADES = 10
+# --- الإعدادات الجديدة المطلوبة ---
+INITIAL_BALANCE = 1000.0    # الرصيد الإجمالي 1000 دولار
+TRADE_AMOUNT = 50.0        # كل صفقة بـ 50 دولار
+MAX_OPEN_TRADES = 20       # فتح 20 صفقة
+# --------------------------------
+
 STOP_LOSS_PCT = -0.05
 MIN_PROFIT_FOR_EXIT = 0.05
 EXIT_SCORE_THRESHOLD = 95
@@ -50,9 +51,7 @@ def init_db():
              open_time TEXT, close_time TEXT)''')
         conn.commit()
         cur.close(); conn.close()
-        print("✅ قاعدة البيانات جاهزة.")
-    except Exception as e:
-        print(f"❌ فشل القاعدة: {e}")
+    except Exception as e: print(f"DB Error: {e}")
 
 # ======================== 2. محرك التحليل ========================
 
@@ -71,7 +70,7 @@ async def perform_analysis(sym, exchange_instance):
         return int(score), close.iloc[-1]
     except: return 0, 0
 
-# ======================== 3. التداول ========================
+# ======================== 3. منطق التداول ========================
 
 async def main_engine():
     init_db()
@@ -97,9 +96,11 @@ async def main_engine():
                 if cur.fetchone()[0] == 0:
                     cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
                     if cur.fetchone()[0] < MAX_OPEN_TRADES:
+                        # إضافة وقت الدخول بالدقيقة والثانية
+                        entry_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, status, score, open_time) VALUES (%s, %s, %s, %s, 'OPEN', %s, %s)", 
-                                   (best['symbol'], best['price'], best['price'], TRADE_AMOUNT, best['score'], datetime.now().strftime('%H:%M:%S')))
-                        send_telegram_msg(f"💎 *دخول:* {best['symbol']}")
+                                   (best['symbol'], best['price'], best['price'], TRADE_AMOUNT, best['score'], entry_time))
+                        send_telegram_msg(f"💎 *دخول صفقة: {best['symbol']}*\n⏰ الوقت: `{entry_time}`\n💰 السعر: `{best['price']}`")
 
             cur.execute("SELECT * FROM trades WHERE status = 'OPEN'")
             for ot in cur.fetchall():
@@ -108,17 +109,17 @@ async def main_engine():
                 pnl = (current_p - ot['entry_price']) / ot['entry_price']
                 s_score, _ = await perform_analysis(sym, EXCHANGE)
                 if pnl <= STOP_LOSS_PCT or (s_score >= EXIT_SCORE_THRESHOLD and pnl >= MIN_PROFIT_FOR_EXIT):
-                    cur.execute("UPDATE trades SET exit_price=%s, status='CLOSED', close_time=%s WHERE symbol=%s", (current_p, datetime.now().strftime('%H:%M:%S'), sym))
-                    send_telegram_msg(f"🛑 *إغلاق:* {sym} ({pnl*100:+.2f}%)")
+                    close_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    cur.execute("UPDATE trades SET exit_price=%s, status='CLOSED', close_time=%s WHERE symbol=%s", (current_p, close_time, sym))
+                    send_telegram_msg(f"🛑 *إغلاق صفقة: {sym}*\n📈 الربح: `{pnl*100:+.2f}%` \n⏰ الوقت: `{close_time}`")
                 else:
                     cur.execute("UPDATE trades SET current_price=%s WHERE symbol=%s", (current_p, sym))
 
             conn.commit(); cur.close(); conn.close()
             await asyncio.sleep(20)
-        except Exception as e:
-            print(f"Error: {e}"); await asyncio.sleep(15)
+        except Exception as e: await asyncio.sleep(15)
 
-# ======================== 4. الموقع ========================
+# ======================== 4. واجهة الموقع ========================
 
 @app.route('/')
 def index():
@@ -135,37 +136,23 @@ def index():
         cur.close(); conn.close()
 
         html_code = """
-        <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
-        <title>Dashboard</title><style>
+        <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
+        <title>التداول الآلي</title><style>
         body { background: #0b0e11; color: white; font-family: sans-serif; padding: 20px; direction: rtl; }
-        .stats { display: flex; gap: 15px; margin-bottom: 25px; }
-        .card { background: #1e2329; padding: 15px; border-radius: 10px; flex: 1; text-align: center; border-top: 4px solid #f0b90b; }
+        .stats { display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }
+        .card { background: #1e2329; padding: 15px; border-radius: 10px; flex: 1; min-width: 180px; text-align: center; border-top: 4px solid #f0b90b; }
         .profit { color: #0ecb81; } .loss { color: #f6465d; }
         table { width: 100%; border-collapse: collapse; background: #1e2329; margin-top: 15px; }
-        th, td { padding: 12px; text-align: center; border-bottom: 1px solid #2b3139; }
+        th, td { padding: 12px; text-align: right; border-bottom: 1px solid #2b3139; font-size: 14px; }
         </style></head><body>
-        <h1>📊 المحفظة</h1>
+        <h1>📊 حالة المحفظة</h1>
         <div class="stats">
-        <div class="card"><h3>الرصيد</h3><p>${{ "%.2f"|format(500 + realized + floating) }}</p></div>
+        <div class="card"><h3>الرصيد الكلي</h3><p>${{ "%.2f"|format(INITIAL_BALANCE + realized + floating) }}</p></div>
         <div class="card"><h3>ربح عائم</h3><p class="{{ 'profit' if floating >= 0 else 'loss' }}">${{ "%+.2f"|format(floating) }}</p></div>
-        <div class="card"><h3>ربح محقق</h3><p class="{{ 'profit' if realized >= 0 else 'loss' }}">${{ "%+.2f"|format(realized) }}</p></div>
+        <div class="card"><h3>عدد الصفقات</h3><p>{{ opens|length }} / 20</p></div>
         </div>
-        <h2>🚀 المفتوحة ({{ opens|length }})</h2>
-        <table><tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>%</th></tr>
+        <h2>🚀 صفقات نشطة</h2>
+        <table><tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>%</th><th>وقت الدخول</th></tr>
         {% for t in opens %}
         <tr><td>{{ t.symbol }}</td><td>{{ t.entry_price }}</td><td>{{ t.current_price }}</td>
-        <td class="{{ 'profit' if t.current_price >= t.entry_price else 'loss' }}">{{ "%+.2f"|format(((t.current_price-t.entry_price)/t.entry_price)*100) }}%</td></tr>
-        {% endfor %}</table>
-        <h2>✅ المغلقة</h2>
-        <table><tr><th>العملة</th><th>النتيجة</th><th>الوقت</th></tr>
-        {% for t in closeds %}
-        <tr><td>{{ t.symbol }}</td><td class="{{ 'profit' if t.exit_price >= t.entry_price else 'loss' }}">{{ "%+.2f"|format(((t.exit_price-t.entry_price)/t.entry_price)*100) }}%</td><td>{{ t.close_time }}</td></tr>
-        {% endfor %}</table></body></html>
-        """
-        return render_template_string(html_code, opens=opens, closeds=closeds, realized=realized, floating=floating)
-    except Exception as e: return str(e)
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
-    asyncio.run(main_engine())
+        <td class="{{ 'profit' if t.current_price >= t.entry_price else 'loss' }}">{{ "%+.2f"|format(((t.current_price-t.entry_price)/t
