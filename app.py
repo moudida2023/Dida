@@ -25,7 +25,11 @@ CURRENT_BALANCE = 500.0
 MAX_TRADES = 10
 TRADE_AMOUNT = 50.0 
 OPEN_TRADES = {}     
-SEARCH_HISTORY = [] # سجل العملات المكتشفة الفريدة (80+)
+SEARCH_HISTORY = [] 
+
+# عتبات السكور (تم التعديل لتنشيط الجدول)
+TABLE_SCORE_THRESHOLD = 50  # سيظهر أي شيء فوق 50 في الجدول فوراً
+TRADE_SCORE_THRESHOLD = 85  # سيشتري البوت آلياً فقط عند 85+
 
 ACTIVATION_PCT = 0.03
 CALLBACK_PCT = 0.015
@@ -33,11 +37,9 @@ CALLBACK_PCT = 0.015
 # ======================== 2. لوحة التحكم (الويب) ========================
 
 async def update_live_prices_in_history():
-    """تحديث الأسعار اللحظية لكل شيء في الجدول قبل عرض الصفحة"""
     if not SEARCH_HISTORY: return
     try:
-        # جلب أسعار آخر 30 عملة فريدة في السجل
-        symbols_to_update = list(set([x['sym'] for x in SEARCH_HISTORY[-30:]]))
+        symbols_to_update = list(set([x['sym'] for x in SEARCH_HISTORY[-20:]]))
         if symbols_to_update:
             tickers = await EXCHANGE.fetch_tickers(symbols_to_update)
             for item in SEARCH_HISTORY:
@@ -47,24 +49,21 @@ async def update_live_prices_in_history():
 
 @app.route('/')
 def home():
-    # تحديث الأسعار عند كل تحميل للصفحة
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(update_live_prices_in_history())
     
-    # جدول الصفقات المفتوحة
     trades_html = "".join([f"<tr><td>{s}</td><td>{d['entry']:.6f}</td><td>{d['current']:.6f}</td><td style='color:{'#00ff00' if ((d['current']-d['entry'])/d['entry'])>=0 else '#ff4444'}; font-weight:bold;'>{((d['current']-d['entry'])/d['entry'])*100:+.2f}%</td><td>{d.get('score','N/A')}</td><td>{'🔥 ملاحقة' if d.get('trailing_active') else '⏳ انتظار'}</td></tr>" for s, d in OPEN_TRADES.items()])
 
-    # جدول الرادار (التاريخ الفريد)
     history_html = ""
-    for item in reversed(SEARCH_HISTORY[-50:]):
+    for item in reversed(SEARCH_HISTORY[-40:]):
         disc_p = item['price']
         live_p = item.get('live_price', disc_p)
         change = ((live_p - disc_p) / disc_p) * 100
         history_html += f"<tr><td>{item['time']}</td><td><strong>{item['sym']}</strong></td><td>{item['score']}</td><td>{disc_p:.6f}</td><td>{live_p:.6f}</td><td style='color:{'#00ff00' if change>=0 else '#ff4444'}; font-weight:bold;'>{change:+.2f}%</td></tr>"
 
     return f"""
-    <html><head><title>Sniper Elite v13</title><meta http-equiv="refresh" content="30">
+    <html><head><title>Sniper Elite v14</title><meta http-equiv="refresh" content="30">
     <style>
         body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; margin: 0; }}
         .header {{ background: #1e2329; padding: 15px; border-bottom: 2px solid #f0b90b; text-align: center; }}
@@ -75,79 +74,80 @@ def home():
         h2 {{ color: #f0b90b; text-align: center; margin-top: 20px; }}
     </style></head>
     <body>
-        <div class="header"><h1>🚀 Sniper Elite Dashboard v13</h1></div>
+        <div class="header"><h1>🚀 Sniper Elite Dashboard v14</h1></div>
         <div class="stats">
             <span>Balance: <b>{CURRENT_BALANCE:.2f} USDT</b></span>
             <span>Active Trades: <b>{len(OPEN_TRADES)} / {MAX_TRADES}</b></span>
-            <span>Auto-Refresh: <b>30s</b></span>
+            <span>Status: <b style="color:#00ff00;">SCANNING LIVE</b></span>
         </div>
         <div class="container">
             <h2>💎 الصفقات الحالية</h2>
             <table><thead><tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>الربح %</th><th>السكور</th><th>الحالة</th></tr></thead><tbody>{trades_html if trades_html else "<tr><td colspan='6'>لا توجد صفقات مفتوحة</td></tr>"}</tbody></table>
-            <h2>🏆 رادار الفرص الفريدة (سكور 80+ | إضافة فورية)</h2>
-            <table><thead><tr><th>وقت الرصد</th><th>العملة</th><th>السكور</th><th>سعر الاكتشاف</th><th>السعر الحالي</th><th>الأداء اللحظي</th></tr></thead><tbody>{history_html if history_html else "<tr><td colspan='6'>جاري مسح السوق...</td></tr>"}</tbody></table>
+            <h2>🏆 رادار الفرص (سكور {TABLE_SCORE_THRESHOLD}+)</h2>
+            <table><thead><tr><th>وقت الرصد</th><th>العملة</th><th>السكور</th><th>سعر الاكتشاف</th><th>السعر الحالي</th><th>الأداء اللحظي</th></tr></thead><tbody>{history_html if history_html else "<tr><td colspan='6'>جاري مسح السوق... انتظر 5-10 دقائق</td></tr>"}</tbody></table>
         </div></body></html>"""
 
-# ======================== 3. المحرك الفني ودورة البحث السريع ========================
+# ======================== 3. المحرك الفني ودورة البحث ========================
 
 async def calculate_elite_score(sym):
     try:
         score = 0
-        # انضغاط البولنجر (40 نقطة)
+        # 1. Bollinger Squeeze (40 pts)
         for tf, weight in [('4h', 20), ('1h', 10), ('15m', 10)]:
             bars = await EXCHANGE.fetch_ohlcv(sym, timeframe=tf, limit=50)
             df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
             width = (4 * df['close'].rolling(20).std()) / (df['close'].rolling(20).mean() + 1e-9)
-            if width.iloc[-1] < 0.04: score += weight
+            if width.iloc[-1] < 0.05: score += weight # تخفيف القيد قليلاً لزيادة النتائج
 
-        # السيولة والاتجاه (60 نقطة)
+        # 2. Volume & Trend (60 pts)
         bars_4h = await EXCHANGE.fetch_ohlcv(sym, timeframe='4h', limit=100)
         df = pd.DataFrame(bars_4h, columns=['ts','open','high','low','close','vol'])
-        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.3: score += 20
+        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.1: score += 20 # خفض شرط الفوليم قليلاً
         if df['close'].iloc[-1] > df['close'].ewm(span=200, adjust=False).mean().iloc[-1]: score += 20
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        
+        # RSI
+        delta = df['close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        if 50 < rsi.iloc[-1] < 70: score += 20
+        if 45 < rsi.iloc[-1] < 75: score += 20 # توسيع نطاق RSI
+        
         return score, df['close'].iloc[-1]
     except: return 0, 0
 
 async def sniper_cycle():
     global CURRENT_BALANCE
     while True:
+        print(f"--- تبدأ دورة البحث الجديدة: {datetime.now().strftime('%H:%M:%S')} ---")
         try:
-            start_time = datetime.now()
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s and s not in EXCLUDE_LIST]
             
             for sym in symbols:
                 score, price = await calculate_elite_score(sym)
                 
-                # --- الإضافة الفورية للجدول (سكور 80+ وبدون تكرار) ---
-                if score >= 60:
-                    existing_symbols = [item['sym'] for item in SEARCH_HISTORY[-50:]]
+                # إضافة فورية للجدول إذا حقق السكور المخفف
+                if score >= TABLE_SCORE_THRESHOLD:
+                    existing_symbols = [item['sym'] for item in SEARCH_HISTORY[-40:]]
                     if sym not in existing_symbols:
                         SEARCH_HISTORY.append({
                             'sym': sym, 'score': score, 'price': price, 'live_price': price,
                             'time': datetime.now().strftime('%H:%M:%S')
                         })
+                        print(f"✅ إضافة للجدول: {sym} | السكور: {score}")
                         if len(SEARCH_HISTORY) > 100: SEARCH_HISTORY.pop(0)
 
-                # --- الدخول الآلي الفوري (سكور 90+) ---
-                if score >= 80 and sym not in OPEN_TRADES and len(OPEN_TRADES) < MAX_TRADES:
-                    OPEN_TRADES[sym] = {
-                        'entry': price, 'current': price, 'highest_price': price, 
-                        'trailing_active': False, 'score': score
-                    }
+                # الدخول الآلي الفعلي
+                if score >= TRADE_SCORE_THRESHOLD and sym not in OPEN_TRADES and len(OPEN_TRADES) < MAX_TRADES:
+                    OPEN_TRADES[sym] = {'entry': price, 'current': price, 'highest_price': price, 'trailing_active': False, 'score': score}
                     CURRENT_BALANCE -= TRADE_AMOUNT
-                    send_telegram(f"⚡ *قنص آلي:* {sym} (Score: {score})")
+                    send_telegram(f"🚀 *دخول آلي:* {sym} (Score: {score})")
                 
-                await asyncio.sleep(0.01) # سرعة المسح
+                await asyncio.sleep(0.01)
 
-            elapsed = (datetime.now() - start_time).total_seconds()
-            await asyncio.sleep(max(10, 360 - elapsed)) # دورة كل 6 دقائق تقريباً
-        except: await asyncio.sleep(30)
+            print(f"--- انتهت الدورة. تم العثور على {len(SEARCH_HISTORY)} عملة في التاريخ ---")
+            await asyncio.sleep(300) # راحة 5 دقائق
+        except Exception as e:
+            print(f"❌ خطأ: {e}")
+            await asyncio.sleep(30)
 
 async def monitor_trades():
     global CURRENT_BALANCE
@@ -161,19 +161,14 @@ async def monitor_trades():
                     trade['current'] = curr_p
                     pnl = (curr_p - trade['entry']) / trade['entry']
                     if curr_p > trade['highest_price']: trade['highest_price'] = curr_p
-                    
                     if not trade['trailing_active'] and pnl >= ACTIVATION_PCT: trade['trailing_active'] = True
-                    
                     if trade['trailing_active']:
                         if (trade['highest_price'] - curr_p) / trade['highest_price'] >= CALLBACK_PCT:
-                            res = TRADE_AMOUNT * pnl
-                            CURRENT_BALANCE += (TRADE_AMOUNT + res)
+                            res = TRADE_AMOUNT * pnl; CURRENT_BALANCE += (TRADE_AMOUNT + res)
                             send_telegram(f"✅ *إغلاق ربح:* {sym} | {res:+.2f}$")
-                            del OPEN_TRADES[sym]
-                            continue
+                            del OPEN_TRADES[sym]; continue
                     if pnl <= -0.03:
-                        res = TRADE_AMOUNT * pnl
-                        CURRENT_BALANCE += (TRADE_AMOUNT + res)
+                        res = TRADE_AMOUNT * pnl; CURRENT_BALANCE += (TRADE_AMOUNT + res)
                         send_telegram(f"🛡️ *وقف خسارة:* {sym} | {res:+.2f}$")
                         del OPEN_TRADES[sym]
         except: pass
