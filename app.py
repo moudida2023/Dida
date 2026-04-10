@@ -8,71 +8,93 @@ import json
 from flask import Flask, send_file
 from datetime import datetime
 
+# ======================== 1. إعدادات المسارات والقاعدة ========================
 app = Flask('')
-EXCHANGE = ccxt.binance({'enableRateLimit': True})
-DB_FILE = "database.json"
+# تحديد المسار المطلق لضمان صلاحيات الكتابة على السيرفر
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "database.json")
 
-# الإعدادات المطلوبة
+EXCHANGE = ccxt.binance({'enableRateLimit': True})
 MAX_OPEN_TRADES = 20
-ENTRY_SCORE = 70      # السكور المطلوب للصيد الحقيقي
+ENTRY_SCORE = 70      
 INVESTMENT = 50.0
 data_lock = threading.Lock()
 
 class PersistentState:
     def __init__(self):
+        # إنشاء الملف فوراً إذا لم يكن موجوداً
+        if not os.path.exists(DB_FILE):
+            try:
+                with open(DB_FILE, 'w') as f:
+                    json.dump([], f)
+            except Exception as e:
+                print(f"⚠️ فشل إنشاء الملف الأولي: {e}")
+
         self.open_trades = self.load_from_disk()
-        self.last_sync = "بدء المسح الحقيقي..."
+        self.last_sync = "بدء التشغيل..."
         self.total_scanned = 0
 
     def load_from_disk(self):
-        if os.path.exists(DB_FILE):
+        with data_lock:
             try:
-                with open(DB_FILE, 'r') as f: return json.load(f)
-            except: return []
-        return []
+                if os.path.exists(DB_FILE):
+                    with open(DB_FILE, 'r') as f:
+                        content = f.read()
+                        if not content: return []
+                        return json.loads(content)
+            except Exception as e:
+                print(f"❌ خطأ في القراءة: {e}")
+            return []
 
     def save_to_disk(self):
-        with open(DB_FILE, 'w') as f:
-            json.dump(self.open_trades, f, indent=4)
+        """نظام حفظ صارم يضمن الكتابة الفعلية على القرص"""
+        with data_lock:
+            try:
+                # كتابة مؤقتة ثم استبدال لضمان عدم تلف الملف
+                temp_path = DB_FILE + ".tmp"
+                with open(temp_path, 'w') as f:
+                    json.dump(self.open_trades, f, indent=4)
+                os.replace(temp_path, DB_FILE)
+                print(f"💾 تم الحفظ بنجاح! عدد الصفقات: {len(self.open_trades)}")
+            except Exception as e:
+                print(f"❌ فشل ذريع في الكتابة: {e}")
 
 state = PersistentState()
 
-# ======================== محرك التحليل الفني الصارم ========================
+# ======================== 2. محرك التحليل الفني ========================
 
 async def get_real_score(sym):
     try:
-        # جلب بيانات حقيقية (ساعة واحدة)
         bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=50)
         df = pd.DataFrame(bars, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
         close = df['c']
         score = 0
         
-        # 1. انضغاط بولنجر (40 نقطة)
+        # تحليل بولنجر
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
         bandwidth = ((ma20 + (2 * std20)) - (ma20 - (2 * std20))) / ma20
         if bandwidth.iloc[-1] < 0.05: score += 40
             
-        # 2. مؤشر RSI (20 نقطة)
+        # مؤشر RSI
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
         if 45 < rsi.iloc[-1] < 70: score += 20
             
-        # 3. قوة الحجم (20 نقطة)
+        # قوة الحجم والاتجاه
         if df['v'].iloc[-1] > df['v'].mean() * 1.2: score += 20
-            
-        # 4. الاتجاه الصاعد (20 نقطة)
         if close.iloc[-1] > close.rolling(20).mean().iloc[-1]: score += 20
 
         return int(score), close.iloc[-1]
     except:
         return 0, 0
 
-# ======================== المحرك الرئيسي للكتابة ========================
+# ======================== 3. المحرك الرئيسي ========================
 
 async def main_engine():
+    print("🚀 محرك الصيد V52 انطلق...")
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
@@ -83,16 +105,16 @@ async def main_engine():
                 scanned += 1
                 with data_lock: state.total_scanned = scanned
                 
-                # جلب السكور الحقيقي
+                # جلب السكور
                 score, price = await get_real_score(sym)
                 
                 with data_lock:
-                    # تحديث أسعار الصفقات المكتوبة حالياً في الموقع
+                    # تحديث أسعار الصفقات الحالية في الذاكرة
                     for tr in state.open_trades:
                         if tr['sym'] in tickers:
                             tr['current_price'] = tickers[tr['sym']]['last']
 
-                    # إذا وجدت فرصة حقيقية (سكور 70+)، اكتبها فوراً
+                    # شرط الكتابة: سكور 70+ وعدم وجودها سابقاً
                     if score >= ENTRY_SCORE:
                         if not any(t['sym'] == sym for t in state.open_trades):
                             if len(state.open_trades) < MAX_OPEN_TRADES:
@@ -102,18 +124,18 @@ async def main_engine():
                                     'investment': INVESTMENT,
                                     'time': datetime.now().strftime('%H:%M:%S')
                                 })
+                                # استدعاء الحفظ الفوري
                                 state.save_to_disk()
-                                print(f"📍 تم صيد عملة حقيقية: {sym} بسكور {score}")
 
-                await asyncio.sleep(0.02) # سرعة متوازنة للمسح
+                await asyncio.sleep(0.01)
 
             with data_lock: state.last_sync = datetime.now().strftime('%H:%M:%S')
-            await asyncio.sleep(60) # راحة دقيقة بين المسحات
+            await asyncio.sleep(60)
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"⚠️ خطأ: {e}")
             await asyncio.sleep(30)
 
-# ======================== واجهة العرض النهائية ========================
+# ======================== 4. واجهة العرض ========================
 
 @app.route('/')
 def home():
@@ -128,40 +150,14 @@ def home():
         pnl_usd = (pnl_pct / 100) * t['investment']
         color = "#00ff00" if pnl_pct >= 0 else "#ff4444"
         
-        rows += f"""<tr style="border-bottom: 1px solid #2b3139; height: 50px;">
-            <td>{t['time']}</td>
+        rows += f"""<tr style="border-bottom: 1px solid #2b3139;">
+            <td style="padding:12px;">{t['time']}</td>
             <td><b style="color:#f0b90b;">{t['sym']}</b></td>
-            <td><span style="background:#2b3139; padding:3px 8px; border-radius:5px;">{t['score']}</span></td>
+            <td><span style="background:#2b3139; padding:4px 10px; border-radius:4px;">{t['score']}</span></td>
             <td>{t['entry_price']:.4f}</td>
             <td>{t['current_price']:.4f}</td>
             <td style="color:{color}; font-weight:bold;">{pnl_pct:+.2f}% (${pnl_usd:+.2f})</td>
         </tr>"""
     
-    return f"""<html><head><meta http-equiv="refresh" content="10"><title>رادار الصفقات الحقيقي</title></head>
-    <body style="background:#0b0e11; color:#eaecef; font-family:sans-serif; padding:20px;">
-        <div style="max-width:1000px; margin:auto; background:#1e2329; border-radius:12px; padding:25px; border-top: 6px solid #f0b90b; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
-            <h2 style="margin-top:0;">📡 رادار الصفقات المباشر (v51)</h2>
-            <div style="display:flex; justify-content:space-between; background:#2b3139; padding:10px 15px; border-radius:8px; margin-bottom:20px; font-size:0.9em;">
-                <span>⚙️ فحص السوق: <b>{count} عملة</b></span>
-                <span>⏱️ تحديث: <b>{sync}</b></span>
-                <span style="color:#00ff00;">● متصل بباينانس</span>
-            </div>
-            <table style="width:100%; border-collapse:collapse; text-align:center;">
-                <thead><tr style="color:#848e9c; text-transform:uppercase; font-size:0.8em;">
-                    <th>الوقت</th><th>الزوج</th><th>السكور</th><th>الدخول</th><th>الحالي</th><th>الربح/الخسارة</th>
-                </tr></thead>
-                <tbody>{rows if rows else "<tr><td colspan='6' style='padding:40px; color:#848e9c;'>جاري مسح السوق... الصفقات الحقيقية ستظهر هنا فور رصدها.</td></tr>"}</tbody>
-            </table>
-            <div style="margin-top:20px; font-size:0.8em; color:#848e9c;">* ميزانية كل صفقة افتراضية: $50.00</div>
-        </div>
-    </body></html>"""
-
-@app.route('/database')
-def view_db():
-    if os.path.exists(DB_FILE): return send_file(DB_FILE, mimetype='application/json')
-    return "[]"
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
-    asyncio.get_event_loop().run_until_complete(main_engine())
+    return f"""<html><head><meta http-equiv="refresh" content="10"></head>
+    <body style="background:#0b0
