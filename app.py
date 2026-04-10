@@ -9,10 +9,9 @@ from datetime import datetime
 
 # ======================== 1. إعدادات قاعدة البيانات ========================
 app = Flask(__name__)
-DB_PATH = "trading_stable_v111.db"
+DB_PATH = "trading_stable_v112.db"
 
 def get_db_connection():
-    # منع التصادم بين الخيوط (Threads)
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
@@ -26,7 +25,7 @@ def init_db():
              exit_price REAL, investment REAL, status TEXT, score INTEGER, 
              open_time TEXT, close_time TEXT)''')
         conn.commit()
-    print("✅ تم بناء قاعدة البيانات بنجاح.")
+    print("✅ Database Initialized.")
 
 init_db()
 EXCHANGE = ccxt.gateio({'enableRateLimit': True})
@@ -36,18 +35,15 @@ MAX_OPEN_TRADES = 20
 
 async def perform_analysis(sym):
     try:
-        # جلب بيانات الشموع (ساعة واحدة)
         bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=40)
         df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
         close = df['close']
         
         score = 0
-        # شرط ضغط البولنجر
         ma20 = close.rolling(20).mean(); std20 = close.rolling(20).std()
-        bw = ((ma20 + 2*std20) - (ma20 - 2*std20)) / ma20
+        bw = ((ma20 + 2*std20) - (ma20 - 2*std20)) / (ma20 + 1e-9)
         if bw.iloc[-1] < 0.04: score += 50 
         
-        # شرط RSI الصاعد
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -55,42 +51,41 @@ async def perform_analysis(sym):
         if 45 < rsi.iloc[-1] < 70: score += 45 
         
         return int(score), close.iloc[-1]
-    except: return 0, 0
+    except:
+        return 0, 0
 
 # ======================== 3. المحرك الرئيسي (البوت) ========================
 
 async def main_engine():
-    print("🚀 محرك المسح بدأ العمل...")
+    print("🚀 Scanner is running...")
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s and '3L' not in s and '3S' not in s]
             
-            # فحص أول 100 عملة فقط لتجنب ضغط الـ API والحظر
             for sym in symbols[:100]:
                 try:
                     price = tickers[sym]['last']
                     now_time = datetime.now().strftime('%H:%M:%S')
 
                     conn = get_db_connection()
-                    # تحديث الأسعار
                     conn.execute("UPDATE radar SET current_price = ? WHERE symbol = ?", (price, sym))
                     conn.execute("UPDATE trades SET current_price = ? WHERE symbol = ? AND status = 'OPEN'", (price, sym))
 
                     score, _ = await perform_analysis(sym)
 
-                    # رادار الاكتشاف (80+)
+                    # رادار 80+
                     if score >= 80:
                         conn.execute('''INSERT OR IGNORE INTO radar (symbol, discovery_price, current_price, score, discovery_time) 
                                       VALUES (?, ?, ?, ?, ?)''', (sym, price, price, score, now_time))
 
-                    # التداول الافتراضي (90+) مع حد 20 صفقة
+                    # تداول 90+
                     open_count = conn.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'").fetchone()[0]
                     if score >= 90 and open_count < MAX_OPEN_TRADES:
                         conn.execute('''INSERT OR IGNORE INTO trades (symbol, entry_price, current_price, investment, status, score, open_time) 
                                       VALUES (?, ?, ?, 50.0, 'OPEN', score, now_time)''', (sym, price, price, score, now_time))
 
-                    # مراقبة الأهداف (6% ربح / 3% خسارة)
+                    # مراقبة الأهداف
                     trade_info = conn.execute("SELECT entry_price FROM trades WHERE symbol = ? AND status = 'OPEN'", (sym,)).fetchone()
                     if trade_info:
                         entry_p = trade_info[0]
@@ -103,52 +98,47 @@ async def main_engine():
                     conn.commit()
                     conn.close()
                 except:
-                    continue # تجاوز أي عملة تفشل لضمان استمرار البوت
-
-                # استراحة قصيرة جداً بين كل عملة (0.05 ثانية) لتخفيف الضغط
+                    continue
                 await asyncio.sleep(0.05)
             
-            # استراحة المسح الكامل (20 ثانية) للسماح لقاعدة البيانات بالاستقرار
-            print("💤 استراحة المسح الشامل (20 ثانية)...")
             await asyncio.sleep(20)
 
         except Exception as e:
-            print(f"Engine Error: {e}")
+            print(f"Error: {e}")
             await asyncio.sleep(10)
 
-# ======================== 4. واجهة الموقع (Dashboard) ========================
+# ======================== 4. واجهة الموقع ========================
 
 @app.route('/')
 def dashboard():
     radar_rows = ""; open_rows = ""; closed_rows = ""
     conn = get_db_connection()
     try:
-        # جلب بيانات الرادار
-        r_cursor = conn.execute("SELECT * FROM radar ORDER BY discovery_time DESC LIMIT 10")
-        for r in r_cursor:
-            change = ((r[2] - r[1]) / r[1] * 100)
+        # 1. الرادار
+        r_cur = conn.execute("SELECT * FROM radar ORDER BY discovery_time DESC LIMIT 10")
+        for r in r_cur:
+            change = ((r[2] - r[1]) / (r[1] + 1e-9)) * 100
             color = "#00ff00" if change >= 0 else "#ff4444"
             radar_rows += f"<tr><td>{r[4]}</td><td>{r[0]}</td><td>{r[1]:.4f}</td><td>{r[2]:.4f}</td><td style='color:{color}'>{change:+.2f}%</td></tr>"
 
-        # جلب الصفقات المفتوحة
-        o_cursor = conn.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY open_time DESC")
-        for r in o_cursor:
-            change_pct = ((r[2] - r[1]) / r[1] * 100)
-            net_usd = (50.0 * (change_pct / 100))
-            color = "#00ff00" if net_usd >= 0 else "#ff4444"
-            open_rows += f"<tr><td>{r[7]}</td><td><b>{r[0]}</b></td><td>{r[1]:.4f}</td><td style='color:{color}; font-weight:bold;'>{net_usd:+.2f}$ ({change_pct:+.2f}%)</td></tr>"
+        # 2. المفتوحة
+        o_cur = conn.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY open_time DESC")
+        for r in o_cur:
+            ch_pct = ((r[2] - r[1]) / (r[1] + 1e-9)) * 100
+            net = (50.0 * (ch_pct / 100))
+            color = "#00ff00" if net >= 0 else "#ff4444"
+            open_rows += f"<tr><td>{r[7]}</td><td><b>{r[0]}</b></td><td>{r[1]:.4f}</td><td style='color:{color}; font-weight:bold;'>{net:+.2f}$ ({ch_pct:+.2f}%)</td></tr>"
 
-        # جلب الصفقات المغلقة
-        c_cursor = conn.execute("SELECT * FROM trades WHERE status != 'OPEN' ORDER BY close_time DESC LIMIT 10")
-        for r in c_cursor:
-            f_change = ((r[3] - r[1]) / r[1] * 100)
-            f_usd = (50.0 * (f_change / 100))
-            color = "#00ff00" if f_usd >= 0 else "#ff4444"
-            closed_rows += f"<tr><td>{r[8]}</td><td>{r[0]}</td><td>{f_usd:+.2f}$</td><td>{r[5]}</td></tr>"
+        # 3. المغلقة (تم تصحيح اسم المتغير هنا)
+        c_cur = conn.execute("SELECT * FROM trades WHERE status != 'OPEN' ORDER BY close_time DESC LIMIT 10")
+        for r in c_cur:
+            f_ch = ((r[3] - r[1]) / (r[1] + 1e-9)) * 100
+            f_net = (50.0 * (f_ch / 100))
+            color = "#00ff00" if f_net >= 0 else "#ff4444"
+            closed_rows += f"<tr><td>{r[8]}</td><td>{r[0]}</td><td>{f_net:+.2f}$</td><td>{r[5]}</td></tr>"
     finally:
         conn.close()
 
-    # نص الـ HTML مع إغلاق سليم للـ Triple Quotes
     return f"""
     <html><head><meta http-equiv="refresh" content="10">
     <style>
@@ -160,29 +150,31 @@ def dashboard():
         h4 {{ margin: 0 0 10px 0; color: #f0b90b; }}
     </style></head><body>
         <div class="box">
-            <h4>📡 رادار الاكتشاف (80+)</h4>
+            <h4>📡 Radar Discovery (80+)</h4>
             <table>
-                <thead><tr><th>الوقت</th><th>العملة</th><th>الاكتشاف</th><th>الحالي</th><th>تغير %</th></tr></thead>
-                <tbody>{radar_rows if radar_rows else "<tr><td colspan='5'>🔎 جاري الرصد...</td></tr>"}</tbody>
+                <thead><tr><th>Time</th><th>Pair</th><th>Disc. Price</th><th>Live Price</th><th>Change %</th></tr></thead>
+                <tbody>{radar_rows if radar_rows else "<tr><td colspan='5'>Scanning...</td></tr>"}</tbody>
             </table>
         </div>
         <div class="box" style="border-top-color: #00ff00;">
-            <h4>🚀 الصفقات المفتوحة (90+ | دخول 50$)</h4>
+            <h4>🚀 Open Virtual Trades (90+ | $50)</h4>
             <table>
-                <thead><tr><th>الدخول</th><th>العملة</th><th>سعر الدخول</th><th>صافي الربح ($)</th></tr></thead>
-                <tbody>{open_rows if open_rows else "<tr><td colspan='4'>لا توجد صفقات مفتوحة.</td></tr>"}</tbody>
+                <thead><tr><th>Open</th><th>Pair</th><th>Entry</th><th>Net Profit ($)</th></tr></thead>
+                <tbody>{open_rows if open_rows else "<tr><td colspan='4'>No Open Trades.</td></tr>"}</tbody>
             </table>
         </div>
         <div class="box" style="border-top-color: #848e9c;">
-            <h4>✅ سجل الصفقات المغلقة</h4>
+            <h4>✅ Closed Trades History</h4>
             <table>
-                <thead><tr><th>الإغلاق</th><th>العملة</th><th>النتيجة ($)</th><th>الحالة</th></tr></thead>
-                <tbody>{closed_rows if closed_rows else "<tr><td colspan='4'>بانتظار الصفقات المنتهية...</td></tr>"}</tbody>
+                <thead><tr><th>Close</th><th>Pair</th><th>Result ($)</th><th>Status</th></tr></thead>
+                <tbody>{closed_rows if closed_rows else "<tr><td colspan='4'>Waiting for exits...</td></tr>"}</tbody>
             </table>
         </div>
     </body></html>"""
 
 if __name__ == "__main__":
-    # تشغيل Flask في خيط منفصل
     port = int(os.environ.get("PORT", 8080))
-    threading.Thread(
+    # تشغيل الفلاسك
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+    # تشغيل المحرك
+    asyncio.run(main_engine())
