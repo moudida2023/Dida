@@ -125,7 +125,7 @@ async def sniper_cycle():
                 score, price = await calculate_elite_score(sym)
                 
                 # --- الإضافة الفورية للجدول (سكور 80+ وبدون تكرار) ---
-                if score >= 80:
+                if score >= 60:
                     existing_symbols = [item['sym'] for item in SEARCH_HISTORY[-50:]]
                     if sym not in existing_symbols:
                         SEARCH_HISTORY.append({
@@ -135,7 +135,7 @@ async def sniper_cycle():
                         if len(SEARCH_HISTORY) > 100: SEARCH_HISTORY.pop(0)
 
                 # --- الدخول الآلي الفوري (سكور 90+) ---
-                if score >= 90 and sym not in OPEN_TRADES and len(OPEN_TRADES) < MAX_TRADES:
+                if score >= 80 and sym not in OPEN_TRADES and len(OPEN_TRADES) < MAX_TRADES:
                     OPEN_TRADES[sym] = {
                         'entry': price, 'current': price, 'highest_price': price, 
                         'trailing_active': False, 'score': score
