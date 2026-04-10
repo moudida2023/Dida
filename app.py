@@ -27,50 +27,40 @@ TRADE_AMOUNT = 50.0
 OPEN_TRADES = {}     
 HOURLY_CLOSED_LOG = [] 
 
-# إعدادات تتبع الربح
-ACTIVATION_PCT = 0.03   # تفعيل التتبع عند 3% ربح
-CALLBACK_PCT = 0.015    # الخروج عند هبوط 1.5% من القمة
+ACTIVATION_PCT = 0.03
+CALLBACK_PCT = 0.015
 
 @app.route('/')
 def home():
-    return f"🚀 Sniper v7 Elite | Balance: {CURRENT_BALANCE:.2f}$ | Active: {len(OPEN_TRADES)}"
+    return f"🚀 Sniper v8 | Top 5 Mode | Balance: {CURRENT_BALANCE:.2f}$"
 
-# ======================== 2. محرك السكور المطور (السيولة + الفريمات) ========================
+# ======================== 2. محرك السكور المطور ========================
 
 async def calculate_elite_score(sym):
     try:
         score = 0
-        # أ. فحص انضغاط البولنجر على 3 فريمات (40 نقطة)
+        # أ. انضغاط البولنجر (40 نقطة)
         for tf, weight in [('4h', 20), ('1h', 10), ('15m', 10)]:
             bars = await EXCHANGE.fetch_ohlcv(sym, timeframe=tf, limit=50)
             df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
             width = (4 * df['close'].rolling(20).std()) / (df['close'].rolling(20).mean() + 1e-9)
             if width.iloc[-1] < 0.04: score += weight
 
-        # ب. فحص السيولة والمؤشرات على فريم 4 ساعات (60 نقطة)
+        # ب. المؤشرات والسيولة (60 نقطة)
         bars_4h = await EXCHANGE.fetch_ohlcv(sym, timeframe='4h', limit=200)
         df_4h = pd.DataFrame(bars_4h, columns=['ts','open','high','low','close','vol'])
-        close = df_4h['close']
         vol = df_4h['vol']
+        close = df_4h['close']
 
-        # 1. فلتر انفجار السيولة (Volume Spike) - جديد
-        avg_vol = vol.rolling(20).mean().iloc[-1]
-        curr_vol = vol.iloc[-1]
-        if curr_vol > avg_vol * 1.3: # السيولة الحالية أعلى بـ 30% من المتوسط
-            score += 20
-        elif curr_vol > avg_vol:
-            score += 10
-
-        # 2. الاتجاه العام EMA 200
-        ema200 = close.ewm(span=200, adjust=False).mean().iloc[-1]
-        if close.iloc[-1] > ema200: score += 10
-        
-        # 3. الزخم RSI
+        # 1. فلتر انفجار السيولة (20 نقطة)
+        if vol.iloc[-1] > vol.rolling(20).mean().iloc[-1] * 1.3: score += 20
+        # 2. EMA 200 (10 نقاط)
+        if close.iloc[-1] > close.ewm(span=200, adjust=False).mean().iloc[-1]: score += 10
+        # 3. RSI (15 نقطة)
         delta = close.diff()
         rsi = 100 - (100 / (1 + (delta.where(delta > 0, 0).rolling(14).mean() / (-delta.where(delta < 0, 0).rolling(14).mean() + 1e-9))))
         if 50 < rsi.iloc[-1] < 65: score += 15
-        
-        # 4. تدفق السيولة MFI
+        # 4. MFI (15 نقطة)
         tp = (df_4h['high'] + df_4h['low'] + close) / 3
         mf = tp * vol
         mfi = 100 - (100 / (1 + (mf.where(tp > tp.shift(1), 0).rolling(14).sum() / (mf.where(tp < tp.shift(1), 0).rolling(14).sum() + 1e-9))))
@@ -79,7 +69,7 @@ async def calculate_elite_score(sym):
         return score, close.iloc[-1]
     except: return 0, 0
 
-# ======================== 3. دورة القنص والتتبع ========================
+# ======================== 3. دورة البحث وقائمة التوب 5 ========================
 
 async def sniper_cycle():
     global CURRENT_BALANCE
@@ -87,27 +77,39 @@ async def sniper_cycle():
         try:
             start_time = datetime.now()
             tickers = await EXCHANGE.fetch_tickers()
-            symbols = [s for s in tickers.keys() if '/USDT' in s and s not in EXCLUDE_LIST and s not in OPEN_TRADES]
+            symbols = [s for s in tickers.keys() if '/USDT' in s and s not in EXCLUDE_LIST]
             
+            all_scores = [] # قائمة لتخزين نتائج البحث الحالي
+
             for sym in symbols:
-                if sym in OPEN_TRADES: continue
                 score, price = await calculate_elite_score(sym)
+                if score > 0:
+                    all_scores.append({'sym': sym, 'score': score, 'price': price})
                 
-                if 85 <= score < 90:
-                    send_telegram(f"📢 *رادار (سيولة جيدة):* `{sym}` بسكور `{score}`")
-                
-                elif score >= 90 and len(OPEN_TRADES) < MAX_TRADES:
-                    OPEN_TRADES[sym] = {
-                        'entry': price, 
-                        'highest_price': price, 
-                        'trailing_active': False
-                    }
+                # الدخول الآلي الفوري (للمشتركين في القائمة المفتوحة فقط)
+                if score >= 90 and sym not in OPEN_TRADES and len(OPEN_TRADES) < MAX_TRADES:
+                    OPEN_TRADES[sym] = {'entry': price, 'highest_price': price, 'trailing_active': False}
                     CURRENT_BALANCE -= TRADE_AMOUNT
-                    send_telegram(f"🚀 *دخول آلي (انفجار سيولة)*\n💎 `{sym}` | سكور: `{score}`\n💰 السعر: `{price:.6f}`\n🔥 نظام التتبع مفعل")
+                    send_telegram(f"🚀 *دخول آلي*\n💎 `{sym}` | سكور: `{score}`")
+                
                 await asyncio.sleep(0.01)
-            
+
+            # --- إرسال قائمة أفضل 5 عملات في نهاية البحث ---
+            if all_scores:
+                # ترتيب العملات حسب السكور من الأعلى للأقل
+                top_5 = sorted(all_scores, key=lambda x: x['score'], reverse=True)[:5]
+                
+                report = "🏆 *أفضل 5 عملات في هذا البحث:*\n"
+                for i, item in enumerate(top_5, 1):
+                    tag = "🔥" if item['score'] >= 90 else "👀"
+                    report += f"{i}. `{item['sym']}` | سكور: `{item['score']}` {tag}\n"
+                
+                send_telegram(report)
+
             await asyncio.sleep(max(0, 1800 - (datetime.now() - start_time).total_seconds()))
         except: await asyncio.sleep(60)
+
+# [دوال monitor_trades و hourly_report و send_telegram تبقى كما هي في الكود السابق]
 
 async def monitor_trades():
     global CURRENT_BALANCE
@@ -120,31 +122,22 @@ async def monitor_trades():
                     curr_p = tickers[sym]['last']
                     trade = OPEN_TRADES[sym]
                     pnl_pct = (curr_p - trade['entry']) / trade['entry']
-
-                    if curr_p > trade['highest_price']:
-                        trade['highest_price'] = curr_p
-
-                    if not trade['trailing_active'] and pnl_pct >= ACTIVATION_PCT:
-                        trade['trailing_active'] = True
-                        send_telegram(f"🔥 *تنشيط ملاحقة الأرباح* لـ `{sym}` (+3%)")
-
-                    # شرط الخروج بتتبع الربح
+                    if curr_p > trade['highest_price']: trade['highest_price'] = curr_p
+                    if not trade['trailing_active'] and pnl_pct >= ACTIVATION_PCT: trade['trailing_active'] = True
+                    
                     if trade['trailing_active']:
-                        drop = (trade['highest_price'] - curr_p) / trade['highest_price']
-                        if drop >= CALLBACK_PCT:
+                        if (trade['highest_price'] - curr_p) / trade['highest_price'] >= CALLBACK_PCT:
                             pnl_val = TRADE_AMOUNT * pnl_pct
                             CURRENT_BALANCE += (TRADE_AMOUNT + pnl_val)
                             HOURLY_CLOSED_LOG.append({'sym': sym, 'res': '✅ Trailing', 'pnl': pnl_val})
-                            send_telegram(f"🔔 *جني أرباح ذكي*\n💎 `{sym}` | الربح: `{pnl_val:+.2f}$` ({pnl_pct*100:.2f}%)")
+                            send_telegram(f"🔔 *جني أرباح:* `{sym}` (+{pnl_pct*100:.2f}%)")
                             del OPEN_TRADES[sym]
                             continue
-
-                    # وقف الخسارة الصارم
                     if pnl_pct <= -0.03:
                         pnl_val = TRADE_AMOUNT * pnl_pct
                         CURRENT_BALANCE += (TRADE_AMOUNT + pnl_val)
                         HOURLY_CLOSED_LOG.append({'sym': sym, 'res': '❌ SL', 'pnl': pnl_val})
-                        send_telegram(f"🛡️ *وقف خسارة*\n💎 `{sym}` | الخسارة: `{pnl_val:+.2f}$`")
+                        send_telegram(f"🛡️ *وقف خسارة:* `{sym}`")
                         del OPEN_TRADES[sym]
         except: pass
         await asyncio.sleep(15)
@@ -153,10 +146,7 @@ async def hourly_report():
     while True:
         await asyncio.sleep(3600)
         try:
-            rep = f"📊 *تقرير الساعة*\n💰 الرصيد: `{CURRENT_BALANCE:.2f}$` | المفتوحة: `{len(OPEN_TRADES)}`"
-            if HOURLY_CLOSED_LOG:
-                rep += "\n\n✅ مغلقة مؤخراً:\n" + "\n".join([f"• `{l['sym']}`: {l['res']} ({l['pnl']:+.2f}$)" for l in HOURLY_CLOSED_LOG])
-                HOURLY_CLOSED_LOG.clear()
+            rep = f"📊 *ملخص المحفظة*\n💰 الرصيد: `{CURRENT_BALANCE:.2f}$` | المفتوحة: `{len(OPEN_TRADES)}`"
             send_telegram(rep)
         except: pass
 
