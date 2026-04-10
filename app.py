@@ -1,121 +1,135 @@
 import asyncio
 import ccxt.pro as ccxt
+import pandas as pd
+import sqlite3
+import os
 import threading
-import requests
 from flask import Flask
 from datetime import datetime
 
+# ======================== 1. إعداد قاعدة البيانات SQL ========================
 app = Flask(__name__)
+DB_PATH = "/tmp/trading_signals_v102.db"
 
-# --- إعدادات التنبيهات ---
-TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
-TELEGRAM_CHAT_ID = '5067771509'
-SCORE_THRESHOLD = 60  # تم الضبط على 60 للتجربة السريعة
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS signals 
+            (symbol TEXT PRIMARY KEY, 
+             entry_price REAL, 
+             current_price REAL, 
+             score INTEGER,
+             time TEXT)''')
+    print("✅ قاعدة بيانات SQL جاهزة.")
 
-# مخزن البيانات في الذاكرة (لضمان الظهور الفوري على الموقع)
-live_trades = {}
+init_db()
+
+EXCHANGE = ccxt.binance({'enableRateLimit': True})
 data_lock = threading.Lock()
 
-# --- وظيفة إرسال تليجرام ---
-def send_telegram(symbol, price, score):
-    tp, sl = price * 1.05, price * 0.97
-    msg = (f"🔔 *إشارة مكتشفة (Score: {score})*\n"
-           f"💎 العملة: `{symbol}`\n"
-           f"💰 الدخول: `{price:.4f}`\n"
-           f"🎯 الهدف: `{tp:.4f}`\n"
-           f"🚫 الوقف: `{sl:.4f}`")
+# ======================== 2. محرك التحليل التقني ========================
+
+async def analyze_market(sym):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
-    except:
-        pass
+        # جلب البيانات للتحليل (البولنجر + RSI + الفوليوم)
+        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=40)
+        df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+        close = df['close']
+        
+        # حساب السكور
+        score = 0
+        # 1. ضغط البولنجر (Squeeze)
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        bw = ((ma20 + 2*std20) - (ma20 - 2*std20)) / ma20
+        if bw.iloc[-1] < 0.045: score += 40
+        
+        # 2. القوة النسبية (RSI)
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+        if 50 < rsi.iloc[-1] < 75: score += 30
+        
+        # 3. الفوليوم
+        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.5: score += 30
+        
+        return int(score), close.iloc[-1]
+    except: return 0, 0
 
-# --- المحرك الرئيسي (Engine) ---
-async def market_engine():
-    exchange = ccxt.binance({'enableRateLimit': True})
-    sent_symbols = set()
-    print(f"🚀 الرادار بدأ العمل.. سكور التجربة: {SCORE_THRESHOLD}")
+# ======================== 3. المحرك الرئيسي (تحديث SQL) ========================
 
+async def main_engine():
     while True:
         try:
-            tickers = await exchange.fetch_tickers()
-            for sym, ticker in tickers.items():
-                if '/USDT' not in sym or 'UP/' in sym or 'DOWN/' in sym:
-                    continue
-
-                price = ticker.get('last', 0)
-                change = ticker.get('percentage', 0)
+            tickers = await EXCHANGE.fetch_tickers()
+            symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
+            
+            for sym in symbols:
+                current_price = tickers[sym]['last']
                 
-                # حساب السكور بناءً على الصعود (أكثر من 1.2% صعود = سكور 60+)
-                current_score = 90 if change > 4 else (75 if change > 2 else (60 if change > 1.2 else 0))
+                # تحديث الأسعار الحالية للعملات الموجودة مسبقاً في SQL
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE signals SET current_price = ? WHERE symbol = ?", (current_price, sym))
+                
+                # فحص العملات الجديدة لإضافتها
+                score, entry_price = await analyze_market(sym)
+                
+                if score >= 70:
+                    now = datetime.now().strftime('%H:%M:%S')
+                    with sqlite3.connect(DB_PATH) as conn:
+                        # إضافة العملة فقط إذا لم تكن موجودة
+                        conn.execute('''INSERT OR IGNORE INTO signals (symbol, entry_price, current_price, score, time) 
+                                      VALUES (?, ?, ?, ?, ?)''', (sym, entry_price, current_price, score, now))
+                
+                await asyncio.sleep(0.01) # منع الحظر
+            
+            await asyncio.sleep(20)
+        except: await asyncio.sleep(10)
 
-                if current_score >= SCORE_THRESHOLD:
-                    with data_lock:
-                        # إضافة أو تحديث البيانات في الذاكرة
-                        if sym not in live_trades:
-                            live_trades[sym] = {
-                                'time': datetime.now().strftime('%H:%M:%S'),
-                                'entry': price,
-                                'current': price,
-                                'score': current_score
-                            }
-                            # إرسال تليجرام للعملات الجديدة فقط
-                            if sym not in sent_symbols:
-                                threading.Thread(target=send_telegram, args=(sym, price, current_score)).start()
-                                sent_symbols.add(sym)
-                        else:
-                            # تحديث السعر الحالي والسكور فقط
-                            live_trades[sym]['current'] = price
-                            live_trades[sym]['score'] = current_score
+# ======================== 4. واجهة الموقع (الأعمدة المطلوبة) ========================
 
-            await asyncio.sleep(10) # تحديث كل 10 ثوانٍ
-        except Exception as e:
-            print(f"Engine Error: {e}")
-            await asyncio.sleep(5)
-
-# --- واجهة العرض (الموقع) ---
 @app.route('/')
-def home():
-    with data_lock:
-        if not live_trades:
-            return "<body style='background:#0b0e11;color:white;text-align:center;'><h2>🔎 جاري مسح السوق.. انتظر صعود عملة فوق 1.2% (سكور 60)</h2></body>"
-        
-        # تحويل القاموس إلى صفوف HTML
-        rows = ""
-        # ترتيب حسب الوقت (الأحدث أولاً)
-        sorted_trades = sorted(live_trades.items(), key=lambda x: x[1]['time'], reverse=True)
-        
-        for sym, details in sorted_trades:
-            color = "#00ff00" if details['current'] >= details['entry'] else "#ff4444"
+def dashboard():
+    rows = ""
+    with sqlite3.connect(DB_PATH) as conn:
+        # عرض آخر 15 عملة تم رصدها
+        cursor = conn.execute("SELECT * FROM signals ORDER BY time DESC LIMIT 15")
+        for r in cursor:
+            # حساب الربح/الخسارة لتلوين السعر الحالي
+            pnl_color = "#00ff00" if r[2] >= r[1] else "#ff4444"
             rows += f"""
-            <tr style="border-bottom:1px solid #2b3139;">
-                <td style="color:#f0b90b; padding:12px;"><b>{sym}</b></td>
-                <td>{details['time']}</td>
-                <td>{details['entry']:.4f}</td>
-                <td style="color:{color}; font-weight:bold;">{details['current']:.4f}</td>
-                <td><span style="background:#363a45; padding:2px 10px; border-radius:10px;">{details['score']}</span></td>
+            <tr style="border-bottom: 1px solid #2b3139;">
+                <td style="color:#f0b90b; font-weight:bold; padding:15px;">{r[0]}</td>
+                <td>{r[1]:.6f}</td>
+                <td style="color:{pnl_color}; font-weight:bold;">{r[2]:.6f}</td>
+                <td><span style="background:#363a45; padding:3px 12px; border-radius:15px;">{r[3]}</span></td>
+                <td style="font-size:0.8em; color:#848e9c;">{r[4]}</td>
             </tr>"""
 
     return f"""
     <html><head><meta http-equiv="refresh" content="10">
     <style>
-        body{{background:#0b0e11; color:white; font-family:sans-serif; text-align:center; padding:20px;}}
-        table{{width:95%; margin:auto; background:#1e2329; border-collapse:collapse; border-radius:10px; overflow:hidden;}}
-        th{{background:#2b3139; color:#848e9c; padding:15px;}}
-        td{{padding:10px; border-bottom:1px solid #2b3139;}}
-    </style></head>
-    <body>
-        <h2 style="color:#f0b90b;">📊 رادار التداول الفوري v95</h2>
-        <p>يتم تحديث الأسعار والسكور تلقائياً كل 10 ثوانٍ</p>
-        <table>
-            <thead><tr><th>العملة</th><th>الوقت</th><th>الدخول</th><th>الحالي</th><th>السكور</th></tr></thead>
-            <tbody>{rows}</tbody>
-        </table>
-    </body></html>
-    """
+        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; text-align: center; padding: 20px; }}
+        .card {{ max-width: 900px; margin: auto; background: #1e2329; border-radius: 12px; padding: 20px; border-top: 5px solid #f0b90b; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th {{ color: #848e9c; padding: 12px; border-bottom: 2px solid #2b3139; }}
+        td {{ padding: 12px; }}
+    </style></head><body>
+        <div class="card">
+            <h2 style="margin-bottom:5px;">📊 رادار التداول SQL</h2>
+            <p style="color:#848e9c; font-size:0.9em;">(التحليل الفني: بولنجر + RSI + سيولة)</p>
+            <table>
+                <thead>
+                    <tr><th>اسم العملة</th><th>سعر الدخول</th><th>السعر الحالي</th><th>السكور</th><th>التوقيت</th></tr>
+                </thead>
+                <tbody>
+                    {rows if rows else "<tr><td colspan='5' style='padding:30px;'>🔎 جاري تحليل أزواج USDT...</td></tr>"}
+                </tbody>
+            </table>
+        </div>
+    </body></html>"""
 
 if __name__ == "__main__":
-    # تشغيل Flask
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
-    # تشغيل المحرك
-    asyncio.get_event_loop().run_until_complete(market_engine())
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+    asyncio.run(main_engine())
