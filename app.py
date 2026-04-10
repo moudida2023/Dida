@@ -4,37 +4,38 @@ import pandas as pd
 import os
 import threading
 import requests
-import csv
 from flask import Flask, send_file
 from datetime import datetime
 
 app = Flask(__name__)
 
-# إعدادات الملف والبيانات
+# استخدام مسار محلي للملف لضمان الاستقرار
 CSV_FILE = "trading_log.csv"
+
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 
-# السكور الجديد المطلوب (60)
-SCORE_LIMIT = 60 
-
+# قفل لمنع تصادم البيانات
 data_lock = threading.Lock()
 
-# --- دالة الكتابة المباشرة في CSV ---
+# دالة مخصصة للكتابة المباشرة والقوية في الملف
 def force_write_csv(row_data):
+    """تضمن كتابة السطر في الملف فوراً"""
     headers = ['Symbol', 'Time', 'Entry', 'Current', 'TP', 'SL', 'Score']
     with data_lock:
         try:
             file_exists = os.path.isfile(CSV_FILE)
             with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+                import csv
                 writer = csv.DictWriter(f, fieldnames=headers)
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(row_data)
+            print(f"💾 تم حفظ {row_data['Symbol']} في الملف بنجاح.")
         except Exception as e:
-            print(f"❌ CSV Write Error: {e}")
+            print(f"❌ فشل الكتابة في الملف: {e}")
 
-# --- دالة تحديث السعر حياً في الملف ---
+# دالة تحديث السعر في الملف (اختياري لكنها تضمن بقاء الملف محدثاً)
 def update_csv_price(symbol, current_price):
     with data_lock:
         try:
@@ -46,7 +47,6 @@ def update_csv_price(symbol, current_price):
         except:
             pass
 
-# --- وظيفة إرسال التنبيه ---
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -54,19 +54,19 @@ def send_telegram(msg):
     except:
         pass
 
-# --- المحرك الرئيسي (Engine) ---
 async def market_engine():
     EXCHANGE = ccxt.binance({'enableRateLimit': True})
     recorded_symbols = set()
     
-    # تحميل البيانات السابقة لمنع التكرار
+    # تحميل العملات المسجلة سابقاً من الملف عند التشغيل
     if os.path.exists(CSV_FILE):
         try:
             df = pd.read_csv(CSV_FILE)
             recorded_symbols = set(df['Symbol'].tolist())
-        except: pass
+        except:
+            pass
 
-    print(f"🚀 الرادار يعمل الآن بحد أدنى للسكور: {SCORE_LIMIT}")
+    print("🚀 الرادار بدأ العمل والكتابة في CSV مفعلة...")
 
     while True:
         try:
@@ -77,15 +77,14 @@ async def market_engine():
                 price = tickers[sym].get('last', 0)
                 change = tickers[sym].get('percentage', 0)
                 
-                # تحديث الأسعار للعملات المسجلة
+                # تحديث السعر الحالي في الملف للعملات القديمة
                 if sym in recorded_symbols:
                     update_csv_price(sym, price)
 
-                # منطق السكور (معدل ليبدأ من 60)
-                # صعود 1.5% يعطي سكور 65، صعود 3% يعطي سكور 85
-                current_score = 90 if change > 4 else (70 if change > 2 else (65 if change > 1.5 else 0))
+                # منطق السكور 85+
+                score = 90 if change > 4.5 else (85 if change > 3.5 else 0)
                 
-                if current_score >= SCORE_LIMIT and sym not in recorded_symbols:
+                if score >= 85 and sym not in recorded_symbols:
                     row = {
                         'Symbol': sym,
                         'Time': datetime.now().strftime('%H:%M:%S'),
@@ -93,46 +92,47 @@ async def market_engine():
                         'Current': price,
                         'TP': price * 1.05,
                         'SL': price * 0.97,
-                        'Score': current_score
+                        'Score': score
                     }
                     
+                    # حفظ في CSV فوراً
                     force_write_csv(row)
                     recorded_symbols.add(sym)
                     
-                    msg = f"🔔 *إشارة دخول (Score: {current_score})*\n💎 العملة: `{sym}`\n💰 السعر: `{price:.4f}`"
+                    # إرسال تليجرام
+                    msg = f"🎯 *إشارة جديدة: {sym}*\n💰 السعر: `{price:.4f}`\n📊 السكور: `{score}`"
                     threading.Thread(target=send_telegram, args=(msg,)).start()
 
             await asyncio.sleep(15)
         except Exception as e:
-            print(f"⚠️ Error: {e}")
+            print(f"⚠️ Engine Error: {e}")
             await asyncio.sleep(10)
 
-# --- الواجهة البرمجية (Flask) ---
 @app.route('/')
 def home():
     if not os.path.exists(CSV_FILE):
-        return "<h1>البحث جارٍ عن عملات بسكور 60+...</h1>"
+        return "<h1>البحث جارٍ... الملف لم يُنشأ بعد</h1>"
     
     with data_lock:
         df = pd.read_csv(CSV_FILE)
         rows = ""
         for _, r in df.iloc[::-1].iterrows():
             color = "#00ff00" if float(r['Current']) >= float(r['Entry']) else "#ff4444"
-            rows += f"""<tr style="border-bottom: 1px solid #2b3139;">
+            rows += f"""<tr style="border-bottom:1px solid #2b3139;">
                 <td style="color:#f0b90b; padding:12px;"><b>{r['Symbol']}</b></td>
                 <td>{r['Time']}</td>
                 <td>{r['Entry']}</td>
                 <td style="color:{color};">{r['Current']}</td>
-                <td><span style="background:#2b3139; padding:2px 8px; border-radius:5px;">{r['Score']}</span></td>
+                <td>{r['Score']}</td>
             </tr>"""
     
-    return f"""<html><head><meta http-equiv="refresh" content="20">
-    <style>body{{background:#0b0e11;color:white;text-align:center;font-family:sans-serif;}} table{{width:90%;margin:auto;background:#1e2329;border-collapse:collapse;}} th{{padding:10px;color:#848e9c;}}</style>
-    </head><body>
-        <h2>📊 رادار التداول v86 (السكور 60+)</h2>
-        <table><thead><tr><th>العملة</th><th>الوقت</th><th>دخول</th><th>حالي</th><th>السكور</th></tr></thead>
-        <tbody>{rows}</tbody></table><br>
-        <a href="/download" style="color:#f0b90b; text-decoration:none; border:1px solid #f0b90b; padding:5px 10px; border-radius:5px;">📥 تحميل ملف CSV</a>
+    return f"""<html><body style="background:#0b0e11;color:white;text-align:center;font-family:sans-serif;">
+        <h2>📊 سجل التداول المباشر (CSV)</h2>
+        <table style="width:90%;margin:auto;background:#1e2329;border-collapse:collapse;">
+            <thead><tr><th>العملة</th><th>الوقت</th><th>دخول</th><th>حالي</th><th>السكور</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        <br><a href="/download" style="color:#f0b90b;">📥 تحميل الملف الآن</a>
     </body></html>"""
 
 @app.route('/download')
