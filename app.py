@@ -8,29 +8,30 @@ import threading
 from flask import Flask, render_template_string
 from datetime import datetime
 
+# ======================== 1. الإعدادات والربط ========================
 app = Flask(__name__)
-SCAN_HISTORY = [] 
 
 DB_URL = os.environ.get('DATABASE_URL')
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
+INITIAL_BALANCE = 500.0 # الرصيد الافتراضي كما طلبت
+
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode='require')
 
-# ======================== 2. محرك الفتح الإجباري (Forced Entry) ========================
+# ======================== 2. محرك إدارة الصفقات والمحفظة v159 ========================
 
 async def main_engine():
-    global SCAN_HISTORY
-    # --- خطوة حاسمة: تنظيف قاعدة البيانات عند التشغيل ---
+    # إعادة تهيئة الجدول مع إضافة عمود الاستثمار
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # حذف الجدول القديم لضمان توافق الهيكل الجديد 100%
         cur.execute("DROP TABLE IF EXISTS trades")
         cur.execute('''CREATE TABLE trades 
             (symbol TEXT PRIMARY KEY, entry_price REAL, current_price REAL, 
-             investment REAL, status TEXT, score INTEGER, open_time TEXT)''')
+             tp REAL, sl REAL, score INTEGER, open_time TEXT, 
+             investment REAL, status TEXT)''')
         conn.commit()
         cur.close(); conn.close()
     except: pass
@@ -40,57 +41,80 @@ async def main_engine():
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
-            valid_symbols = [s for s in tickers if '/USDT' in s][:200]
+            # فحص العملات الأكثر سيولة في USDT
+            valid_symbols = [s for s in tickers if '/USDT' in s]
+            top_symbols = sorted(valid_symbols, key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:50]
             
-            all_hits = []
-            for sym in valid_symbols:
-                try:
-                    # سكور سهل جداً (50) للتأكد من فتح صفقات فوراً
-                    all_hits.append({'symbol': sym, 'score': 99, 'price': tickers[sym]['last']})
-                except: continue
-                if len(all_hits) > 10: break # نكتفي بـ 10 للتجربة
+            conn = get_db_connection()
+            cur = conn.cursor()
 
-            if all_hits:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                for hit in all_hits:
-                    # إدخال مبسط جداً بدون تعقيدات
-                    cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, investment, status, score, open_time) 
-                                   VALUES (%s, %s, %s, 50, 'OPEN', %s, %s) 
-                                   ON CONFLICT (symbol) DO NOTHING""", 
-                                (hit['symbol'], hit['price'], hit['price'], hit['score'], datetime.now().strftime('%H:%M:%S')))
-                conn.commit()
-                cur.close(); conn.close()
+            for sym in top_symbols:
+                price = tickers[sym]['last']
+                # حساب أهداف ذكية: ربح 2% ووقف 3%
+                tp_price = price * 1.02
+                sl_price = price * 0.97
+                
+                # إدخال الصفقات (محاكاة دخول بمبلغ 50 دولار لكل صفقة)
+                cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, tp, sl, score, open_time, investment, status) 
+                               VALUES (%s, %s, %s, %s, %s, 85, %s, 50.0, 'OPEN') 
+                               ON CONFLICT (symbol) DO UPDATE SET current_price = EXCLUDED.current_price""", 
+                            (sym, price, price, tp_price, sl_price, datetime.now().strftime('%H:%M:%S')))
+            
+            conn.commit()
+            cur.close(); conn.close()
+            await asyncio.sleep(8) 
+        except Exception as e:
+            await asyncio.sleep(10)
 
-            SCAN_HISTORY.insert(0, {'time': datetime.now().strftime('%H:%M:%S'), 'found': len(all_hits)})
-            await asyncio.sleep(15)
-        except: await asyncio.sleep(10)
-
-# ======================== 3. لوحة التحكم ========================
+# ======================== 3. واجهة المحفظة والصفقات ========================
 
 @app.route('/')
 def index():
-    opens = []
+    trades = []
+    total_unrealized_pnl = 0
+    active_investments = 0
+    
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.DictCursor)
-        cur.execute("SELECT * FROM trades")
-        opens = cur.fetchall()
+        cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
+        trades = cur.fetchall()
         cur.close(); conn.close()
+        
+        # حساب إحصائيات المحفظة
+        for t in trades:
+            pnl = ((t['current_price'] - t['entry_price']) / t['entry_price']) * t['investment']
+            total_unrealized_pnl += pnl
+            active_investments += t['investment']
     except: pass
 
-    return render_template_string("""
-    <body style="background:#000; color:#0f0; direction:rtl; font-family:sans-serif; padding:20px;">
-        <h2>🚀 فحص نظام الإدخال v157</h2>
-        <p>إذا كان الجدول أدناه فارغاً، المشكلة في رابط DATABASE_URL حصراً.</p>
-        <table border="1" style="width:100%; border-collapse:collapse;">
-            <tr><th>العملة</th><th>السعر</th><th>السكور</th><th>الحالة</th></tr>
-            {% for t in opens %}
-            <tr><td>{{ t.symbol }}</td><td>{{ t.entry_price }}</td><td>{{ t.score }}</td><td>{{ t.status }}</td></tr>
-            {% endfor %}
-        </table>
-    </body>""", opens=opens)
-
-if __name__ == "__main__":
-    threading.Thread(target=lambda: asyncio.run(main_engine()), daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    html = """
+    <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="5">
+    <title>Portfolio Manager v159</title>
+    <style>
+        body { background: #0b0e11; color: white; font-family: 'Segoe UI', sans-serif; padding: 20px; direction: rtl; }
+        .dashboard { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
+        .stat-card { background: #1e2329; padding: 20px; border-radius: 12px; border-bottom: 4px solid #f0b90b; text-align: center; }
+        .stat-val { font-size: 24px; font-weight: bold; margin-top: 10px; }
+        .profit { color: #0ecb81; } .loss { color: #f6465d; }
+        table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 12px; overflow: hidden; }
+        th { background: #2b3139; color: #848e9c; padding: 15px; font-size: 13px; text-align: center; }
+        td { padding: 15px; text-align: center; border-bottom: 1px solid #2b3139; }
+        .symbol-tag { background: #474d57; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+    </style></head><body>
+        <div style="max-width: 1200px; margin: auto;">
+            <h1 style="color: #f0b90b;">🛰️ رادار الصفقات وحالة المحفظة</h1>
+            
+            <div class="dashboard">
+                <div class="stat-card">
+                    <div style="color: #848e9c;">الرصيد الافتراضي</div>
+                    <div class="stat-val">${{ "%.2f"|format(500 + total_unrealized_pnl) }}</div>
+                </div>
+                <div class="stat-card">
+                    <div style="color: #848e9c;">إجمالي الأرباح/الخسائر</div>
+                    <div class="stat-val {{ 'profit' if total_unrealized_pnl >= 0 else 'loss' }}">
+                        {{ "%+.2f"|format(total_unrealized_pnl) }} USDT
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div style="color: #848
