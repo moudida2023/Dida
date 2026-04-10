@@ -8,21 +8,21 @@ import json
 from flask import Flask, send_file
 from datetime import datetime
 
-# ======================== 1. الإعدادات ========================
 app = Flask('')
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 DB_FILE = "database.json"
 
-MAX_OPEN_TRADES = 20         # تم التعديل لـ 20
-ENTRY_SCORE = 70             # تم خفض السكور لـ 70
-INVESTMENT_PER_TRADE = 50.0
+# إعدادات مخففة جداً لضمان العمل الآن
+MAX_OPEN_TRADES = 20
+ENTRY_SCORE = 50 # سكور منخفض جداً للتأكد من امتلاء الجدول
+INVESTMENT = 50.0
 data_lock = threading.Lock()
 
 class PersistentState:
     def __init__(self):
         self.open_trades = self.load_from_disk()
-        self.last_sync = "انتظار..."
-        self.total_scanned = 0 # عداد العملات المفحوصة
+        self.last_sync = "بدء المسح..."
+        self.total_scanned = 0
 
     def load_from_disk(self):
         if os.path.exists(DB_FILE):
@@ -37,111 +37,83 @@ class PersistentState:
 
 state = PersistentState()
 
-# ======================== 2. محرك التحليل ========================
-
-async def get_score(sym):
+async def get_score_fast(sym):
     try:
-        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=100)
-        df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-        close = df['close']
-        score = 0
+        # جلب أقل عدد ممكن من الشمعات لتسريع السيرفر
+        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=30)
+        df = pd.DataFrame(bars, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+        last_price = df['c'].iloc[-1]
         
-        # بولنجر (40)
-        ma20 = close.rolling(20).mean(); std20 = close.rolling(20).std()
-        bandwidth = ((ma20 + (2 * std20)) - (ma20 - (2 * std20))) / ma20
-        if bandwidth.iloc[-1] < 0.05: score += 40 # تساهل بسيط في الانضغاط
-            
-        # RSI (20)
-        delta = close.diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        if 45 < rsi.iloc[-1] < 75: score += 20 # توسيع نطاق RSI
-            
-        # حجم التداول (20)
-        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.2: score += 20
-            
-        # الاتجاه (20)
-        if close.iloc[-1] > close.rolling(50).mean().iloc[-1]: score += 20
-
-        return int(score), close.iloc[-1]
+        # شرط بسيط جداً: إذا كانت الشمعة الحالية خضراء والسيولة موجودة
+        score = 0
+        if df['c'].iloc[-1] > df['o'].iloc[-1]: score += 30
+        if df['v'].iloc[-1] > df['v'].mean(): score += 30
+        if df['c'].iloc[-1] > df['c'].iloc[-5]: score += 20
+        
+        return score, last_price
     except: return 0, 0
 
-# ======================== 3. المحرك الرئيسي ========================
-
 async def main_engine():
+    print("🚀 المحرك بدأ العمل الآن...")
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
             
-            scanned_count = 0
-            candidates = []
-
+            print(f"🔍 تم العثور على {len(symbols)} عملة. بدأ الفحص...")
+            
+            scanned = 0
             for sym in symbols:
-                scanned_count += 1
-                with data_lock: state.total_scanned = scanned_count # تحديث العداد
+                scanned += 1
+                with data_lock: state.total_scanned = scanned
                 
-                score, price = await get_score(sym)
+                # جلب سكور سريع
+                score, price = await get_score_fast(sym)
                 
-                # تحديث الأسعار الحية
                 with data_lock:
+                    # تحديث الأسعار الحية دائماً
                     for tr in state.open_trades:
                         if tr['sym'] == sym: tr['current_price'] = tickers[sym]['last']
 
-                if score >= ENTRY_SCORE:
-                    with data_lock:
+                    if score >= ENTRY_SCORE:
                         if not any(t['sym'] == sym for t in state.open_trades):
-                            candidates.append({'sym': sym, 'score': score, 'price': price})
-                
-                await asyncio.sleep(0.01)
+                            if len(state.open_trades) < MAX_OPEN_TRADES:
+                                state.open_trades.append({
+                                    'sym': sym, 'score': score, 
+                                    'entry_price': price, 'current_price': price,
+                                    'investment': INVESTMENT,
+                                    'time': datetime.now().strftime('%H:%M:%S')
+                                })
+                                state.save_to_disk()
+                                print(f"✅ تم إضافة عملة: {sym}")
 
-            # اختيار الأفضل وإضافته
-            if candidates:
-                candidates.sort(key=lambda x: x['score'], reverse=True)
-                with data_lock:
-                    for c in candidates:
-                        if len(state.open_trades) < MAX_OPEN_TRADES:
-                            state.open_trades.append({
-                                'sym': c['sym'], 'score': c['score'], 
-                                'entry_price': c['price'], 'current_price': c['price'],
-                                'investment': INVESTMENT_PER_TRADE,
-                                'time': datetime.now().strftime('%H:%M:%S')
-                            })
-                    state.save_to_disk()
+                await asyncio.sleep(0.01) # تأخير بسيط لعدم حظر السيرفر
 
             with data_lock: state.last_sync = datetime.now().strftime('%H:%M:%S')
+            print("✅ انتهت دورة المسح بنجاح.")
             await asyncio.sleep(60)
-        except: await asyncio.sleep(30)
-
-# ======================== 4. واجهة الموقع ========================
+        except Exception as e:
+            print(f"⚠️ خطأ في المحرك: {e}")
+            await asyncio.sleep(30)
 
 @app.route('/')
 def home():
     with data_lock:
         active = list(state.open_trades)
         sync = state.last_sync
-        scanned = state.total_scanned
+        count = state.total_scanned
     
-    rows = "".join([f"<tr><td>{t['time']}</td><td><b>{t['sym']}</b></td><td style='color:#f0b90b;'>{t['score']}</td><td>{t['entry_price']:.6f}</td><td>{t['current_price']:.6f}</td><td style='color:{'#00ff00' if t['current_price']>=t['entry_price'] else '#ff4444'};'>{((t['current_price']-t['entry_price'])/t['entry_price']*100):+.2f}% (${((t['current_price']-t['entry_price'])/t['entry_price'])*t['investment']:+.2f})</td></tr>" for t in reversed(active)])
+    rows = "".join([f"<tr><td>{t['time']}</td><td><b>{t['sym']}</b></td><td>{t['score']}</td><td>{t['entry_price']:.6f}</td><td>{t['current_price']:.6f}</td><td>{((t['current_price']-t['entry_price'])/t['entry_price']*100):+.2f}%</td></tr>" for t in reversed(active)])
     
-    return f"""
-    <html><head><meta http-equiv="refresh" content="10"><style>
-        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; padding: 20px; }}
-        .card {{ background: #1e2329; border-radius: 10px; padding: 20px; border-top: 5px solid #f0b90b; }}
-        .progress {{ font-size: 0.85em; color: #00ff00; margin-bottom: 5px; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-        th, td {{ padding: 10px; border: 1px solid #2b3139; text-align: center; }}
-    </style></head><body>
-        <div class="card">
-            <h2>🚀 رادار التداول السريع (v48)</h2>
-            <div class="progress">⚙️ يتم الآن فحص العملة رقم: {scanned} | الحد الأقصى: 20 صفقة | سكور: {ENTRY_SCORE}+</div>
-            <div style="font-size: 0.9em; color: #848e9c;">آخر تحديث: {sync} | الصفقات الحالية: {len(active)}/20</div>
-            <table>
-                <thead><tr><th>الوقت</th><th>الزوج</th><th>السكور</th><th>الدخول</th><th>الحالي</th><th>الربح/الخسارة</th></tr></thead>
-                <tbody>{rows if rows else "<tr><td colspan='6'>جاري البحث في السوق... ستظهر العملات هنا فور تخطيها سكور 70.</td></tr>"}</tbody>
+    return f"""<html><head><meta http-equiv="refresh" content="10"></head><body style="background:#0b0e11; color:white; font-family:sans-serif; padding:20px;">
+        <div style="background:#1e2329; padding:20px; border-radius:10px; border-top:5px solid #f0b90b;">
+            <h2>📊 رادار الطوارئ (v49)</h2>
+            <p>يتم الآن فحص العملة: {count} | آخر تحديث: {sync}</p>
+            <table border="1" style="width:100%; border-collapse:collapse; text-align:center;">
+                <thead><tr><th>الوقت</th><th>الزوج</th><th>السكور</th><th>الدخول</th><th>الحالي</th><th>PNL%</th></tr></thead>
+                <tbody>{rows if rows else "<tr><td colspan='6'>جاري البحث... انتظر دقيقة واحدة.</td></tr>"}</tbody>
             </table>
-        </div>
-    </body></html>"""
+        </div></body></html>"""
 
 @app.route('/database')
 def view_db():
