@@ -1,6 +1,6 @@
 flask
 ccxt
 pandas
-numpy
+psycopg2-binary
 requests
-apscheduler
+asyncio
