@@ -10,7 +10,6 @@ from datetime import datetime
 
 # ======================== 1. إعدادات المسارات والقاعدة ========================
 app = Flask('')
-# تحديد المسار المطلق لضمان صلاحيات الكتابة على السيرفر
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "database.json")
 
@@ -22,13 +21,12 @@ data_lock = threading.Lock()
 
 class PersistentState:
     def __init__(self):
-        # إنشاء الملف فوراً إذا لم يكن موجوداً
         if not os.path.exists(DB_FILE):
             try:
                 with open(DB_FILE, 'w') as f:
                     json.dump([], f)
             except Exception as e:
-                print(f"⚠️ فشل إنشاء الملف الأولي: {e}")
+                print(f"⚠️ Initial file creation failed: {e}")
 
         self.open_trades = self.load_from_disk()
         self.last_sync = "بدء التشغيل..."
@@ -43,21 +41,19 @@ class PersistentState:
                         if not content: return []
                         return json.loads(content)
             except Exception as e:
-                print(f"❌ خطأ في القراءة: {e}")
+                print(f"❌ Read error: {e}")
             return []
 
     def save_to_disk(self):
-        """نظام حفظ صارم يضمن الكتابة الفعلية على القرص"""
         with data_lock:
             try:
-                # كتابة مؤقتة ثم استبدال لضمان عدم تلف الملف
                 temp_path = DB_FILE + ".tmp"
                 with open(temp_path, 'w') as f:
                     json.dump(self.open_trades, f, indent=4)
                 os.replace(temp_path, DB_FILE)
-                print(f"💾 تم الحفظ بنجاح! عدد الصفقات: {len(self.open_trades)}")
+                print(f"💾 Saved! Trades: {len(self.open_trades)}")
             except Exception as e:
-                print(f"❌ فشل ذريع في الكتابة: {e}")
+                print(f"❌ Write error: {e}")
 
 state = PersistentState()
 
@@ -70,20 +66,17 @@ async def get_real_score(sym):
         close = df['c']
         score = 0
         
-        # تحليل بولنجر
         ma20 = close.rolling(20).mean()
         std20 = close.rolling(20).std()
         bandwidth = ((ma20 + (2 * std20)) - (ma20 - (2 * std20))) / ma20
         if bandwidth.iloc[-1] < 0.05: score += 40
             
-        # مؤشر RSI
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
         if 45 < rsi.iloc[-1] < 70: score += 20
             
-        # قوة الحجم والاتجاه
         if df['v'].iloc[-1] > df['v'].mean() * 1.2: score += 20
         if close.iloc[-1] > close.rolling(20).mean().iloc[-1]: score += 20
 
@@ -94,7 +87,6 @@ async def get_real_score(sym):
 # ======================== 3. المحرك الرئيسي ========================
 
 async def main_engine():
-    print("🚀 محرك الصيد V52 انطلق...")
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
@@ -105,16 +97,13 @@ async def main_engine():
                 scanned += 1
                 with data_lock: state.total_scanned = scanned
                 
-                # جلب السكور
                 score, price = await get_real_score(sym)
                 
                 with data_lock:
-                    # تحديث أسعار الصفقات الحالية في الذاكرة
                     for tr in state.open_trades:
                         if tr['sym'] in tickers:
                             tr['current_price'] = tickers[tr['sym']]['last']
 
-                    # شرط الكتابة: سكور 70+ وعدم وجودها سابقاً
                     if score >= ENTRY_SCORE:
                         if not any(t['sym'] == sym for t in state.open_trades):
                             if len(state.open_trades) < MAX_OPEN_TRADES:
@@ -124,15 +113,13 @@ async def main_engine():
                                     'investment': INVESTMENT,
                                     'time': datetime.now().strftime('%H:%M:%S')
                                 })
-                                # استدعاء الحفظ الفوري
                                 state.save_to_disk()
 
                 await asyncio.sleep(0.01)
 
             with data_lock: state.last_sync = datetime.now().strftime('%H:%M:%S')
             await asyncio.sleep(60)
-        except Exception as e:
-            print(f"⚠️ خطأ: {e}")
+        except Exception:
             await asyncio.sleep(30)
 
 # ======================== 4. واجهة العرض ========================
@@ -159,5 +146,32 @@ def home():
             <td style="color:{color}; font-weight:bold;">{pnl_pct:+.2f}% (${pnl_usd:+.2f})</td>
         </tr>"""
     
-    return f"""<html><head><meta http-equiv="refresh" content="10"></head>
-    <body style="background:#0b0
+    # تأكد من إغلاق علامات """ في نهاية النص تماماً
+    html_content = f"""<html><head><meta http-equiv="refresh" content="10"></head>
+    <body style="background:#0b0e11; color:#eaecef; font-family:sans-serif; padding:20px;">
+        <div style="max-width:900px; margin:auto; background:#1e2329; border-radius:12px; padding:20px; border-top: 6px solid #f0b90b;">
+            <h2 style="margin:0 0 15px 0;">🛡️ رادار التداول الاحترافي (v52)</h2>
+            <div style="background:#2b3139; padding:10px; border-radius:8px; display:flex; justify-content:space-between; font-size:0.85em; margin-bottom:15px;">
+                <span>📊 الفحص: <b>{count} عملة</b></span>
+                <span>⏱️ آخر تحديث: <b>{sync}</b></span>
+                <span>💰 الاستثمار: <b>$50/صفقة</b></span>
+            </div>
+            <table style="width:100%; border-collapse:collapse; text-align:center;">
+                <thead><tr style="color:#848e9c; font-size:0.8em; text-transform:uppercase;">
+                    <th>الوقت</th><th>الزوج</th><th>السكور</th><th>الدخول</th><th>الحالي</th><th>PNL (%)</th>
+                </tr></thead>
+                <tbody>{rows if rows else "<tr><td colspan='6' style='padding:50px; color:#848e9c;'>جاري البحث... الصفقات ستظهر هنا بمجرد رصدها.</td></tr>"}</tbody>
+            </table>
+            <div style="margin-top:20px;"><a href="/database" style="color:#f0b90b; text-decoration:none; font-size:0.9em;">📂 عرض JSON</a></div>
+        </div></body></html>"""
+    return html_content
+
+@app.route('/database')
+def view_db():
+    if os.path.exists(DB_FILE): return send_file(DB_FILE, mimetype='application/json')
+    return "[]"
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
+    asyncio.get_event_loop().run_until_complete(main_engine())
