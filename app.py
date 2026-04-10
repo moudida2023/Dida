@@ -3,140 +3,143 @@ import ccxt.pro as ccxt
 import pandas as pd
 import os
 import threading
+import requests
 import csv
-import time
 from flask import Flask, send_file
 from datetime import datetime
 
-# ======================== 1. الإعدادات والمسارات ========================
 app = Flask(__name__)
-CSV_FILE = "/tmp/live_market_data.csv"
-EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
+# إعدادات الملف والبيانات
+CSV_FILE = "trading_log.csv"
+TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
+TELEGRAM_CHAT_ID = '5067771509'
+
+# السكور الجديد المطلوب (60)
 SCORE_LIMIT = 60 
+
 data_lock = threading.Lock()
 
-# ذاكرة مؤقتة لتخزين الصفقات وتحديثها قبل حفظها في CSV
-trades_registry = [] 
-
-def save_all_to_csv():
-    """دالة تقوم بمسح ملف CSV وإعادة كتابة كل الصفقات بالأسعار المحدثة"""
+# --- دالة الكتابة المباشرة في CSV ---
+def force_write_csv(row_data):
+    headers = ['Symbol', 'Time', 'Entry', 'Current', 'TP', 'SL', 'Score']
     with data_lock:
         try:
-            headers = ['Symbol', 'Entry_Time', 'Entry_Price', 'Current_Price', 'PNL_%', 'Score']
-            with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-                for t in trades_registry:
-                    # حساب نسبة التغير اللحظية
-                    pnl = ((t['current_price'] - t['entry_price']) / t['entry_price']) * 100
-                    writer.writerow([
-                        t['sym'], t['time'], f"{t['entry_price']:.4f}", 
-                        f"{t['current_price']:.4f}", f"{pnl:+.2f}%", t['score']
-                    ])
+            file_exists = os.path.isfile(CSV_FILE)
+            with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row_data)
         except Exception as e:
-            print(f"CSV Update Error: {e}")
+            print(f"❌ CSV Write Error: {e}")
 
-# ======================== 2. محرك المسح والتحديث المستمر ========================
+# --- دالة تحديث السعر حياً في الملف ---
+def update_csv_price(symbol, current_price):
+    with data_lock:
+        try:
+            if os.path.exists(CSV_FILE):
+                df = pd.read_csv(CSV_FILE)
+                if symbol in df['Symbol'].values:
+                    df.loc[df['Symbol'] == symbol, 'Current'] = f"{current_price:.4f}"
+                    df.to_csv(CSV_FILE, index=False)
+        except:
+            pass
 
-async def main_engine():
+# --- وظيفة إرسال التنبيه ---
+def send_telegram(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+    except:
+        pass
+
+# --- المحرك الرئيسي (Engine) ---
+async def market_engine():
+    EXCHANGE = ccxt.binance({'enableRateLimit': True})
+    recorded_symbols = set()
+    
+    # تحميل البيانات السابقة لمنع التكرار
+    if os.path.exists(CSV_FILE):
+        try:
+            df = pd.read_csv(CSV_FILE)
+            recorded_symbols = set(df['Symbol'].tolist())
+        except: pass
+
+    print(f"🚀 الرادار يعمل الآن بحد أدنى للسكور: {SCORE_LIMIT}")
+
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
             
             for sym in symbols:
-                await asyncio.sleep(0.01)
-                ticker = tickers[sym]
-                price = ticker.get('last', 0)
-                change = ticker.get('percentage', 0)
+                price = tickers[sym].get('last', 0)
+                change = tickers[sym].get('percentage', 0)
+                
+                # تحديث الأسعار للعملات المسجلة
+                if sym in recorded_symbols:
+                    update_csv_price(sym, price)
 
-                with data_lock:
-                    # أولاً: تحديث السعر الحالي لأي عملة موجودة مسبقاً في القائمة
-                    for t in trades_registry:
-                        if t['sym'] == sym:
-                            t['current_price'] = price
+                # منطق السكور (معدل ليبدأ من 60)
+                # صعود 1.5% يعطي سكور 65، صعود 3% يعطي سكور 85
+                current_score = 90 if change > 4 else (70 if change > 2 else (65 if change > 1.5 else 0))
+                
+                if current_score >= SCORE_LIMIT and sym not in recorded_symbols:
+                    row = {
+                        'Symbol': sym,
+                        'Time': datetime.now().strftime('%H:%M:%S'),
+                        'Entry': price,
+                        'Current': price,
+                        'TP': price * 1.05,
+                        'SL': price * 0.97,
+                        'Score': current_score
+                    }
+                    
+                    force_write_csv(row)
+                    recorded_symbols.add(sym)
+                    
+                    msg = f"🔔 *إشارة دخول (Score: {current_score})*\n💎 العملة: `{sym}`\n💰 السعر: `{price:.4f}`"
+                    threading.Thread(target=send_telegram, args=(msg,)).start()
 
-                    # ثانياً: إضافة عملة جديدة إذا حققت السكور ولم تكن موجودة
-                    score = 75 if change > 1.5 else 0
-                    if score >= SCORE_LIMIT and not any(x['sym'] == sym for x in trades_registry):
-                        trades_registry.append({
-                            'sym': sym,
-                            'time': datetime.now().strftime('%H:%M:%S'),
-                            'entry_price': price,
-                            'current_price': price,
-                            'score': score
-                        })
-            
-            # ثالثاً: حفظ الحالة المحدثة بالكامل في ملف CSV بعد كل دورة مسح
-            save_all_to_csv()
-            
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
         except Exception as e:
-            print(f"⚠️ Engine Error: {e}")
+            print(f"⚠️ Error: {e}")
             await asyncio.sleep(10)
 
-# ======================== 3. واجهة العرض (قراءة البيانات المحدثة) ========================
-
+# --- الواجهة البرمجية (Flask) ---
 @app.route('/')
 def home():
-    with data_lock:
-        active_trades = list(trades_registry)
+    if not os.path.exists(CSV_FILE):
+        return "<h1>البحث جارٍ عن عملات بسكور 60+...</h1>"
     
-    rows_html = ""
-    for t in reversed(active_trades):
-        pnl = ((t['current_price'] - t['entry_price']) / t['entry_price']) * 100
-        color = "#00ff00" if pnl >= 0 else "#ff4444"
-        
-        rows_html += f"""
-        <tr style="border-bottom: 1px solid #2b3139;">
-            <td style="color:#f0b90b; font-weight:bold; padding:12px;">{t['sym']}</td>
-            <td>{t['time']}</td>
-            <td>{t['entry_price']:.4f}</td>
-            <td style="color:{color}; font-weight:bold;">{t['current_price']:.4f}</td>
-            <td style="color:{color};">{pnl:+.2f}%</td>
-            <td>{t['score']}</td>
-        </tr>"""
-
-    return f"""
-    <html>
-    <head>
-        <title>Live CSV Scanner</title>
-        <meta http-equiv="refresh" content="10">
-        <style>
-            body {{ background:#0b0e11; color:white; font-family:sans-serif; padding:20px; }}
-            .container {{ max-width:950px; margin:auto; background:#1e2329; padding:20px; border-radius:15px; border:1px solid #363a45; }}
-            table {{ width:100%; border-collapse:collapse; margin-top:20px; text-align:center; }}
-            th {{ color:#848e9c; padding:10px; border-bottom:2px solid #2b3139; font-size:0.85em; }}
-            .btn {{ color:#f0b90b; text-decoration:none; border:1px solid #f0b90b; padding:5px 12px; border-radius:5px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-                <h2>🔄 رادار CSV المتغير حياً</h2>
-                <a href="/download" class="btn">📥 تحميل ملف CSV المحدث</a>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>العملة</th><th>وقت الدخول</th><th>سعر الدخول</th>
-                        <th>السعر الحالي</th><th>الربح/الخسارة</th><th>السكور</th>
-                    </tr>
-                </thead>
-                <tbody>{rows_html if rows_html else "<tr><td colspan='6'>جاري المراقبة...</td></tr>"}</tbody>
-            </table>
-        </div>
+    with data_lock:
+        df = pd.read_csv(CSV_FILE)
+        rows = ""
+        for _, r in df.iloc[::-1].iterrows():
+            color = "#00ff00" if float(r['Current']) >= float(r['Entry']) else "#ff4444"
+            rows += f"""<tr style="border-bottom: 1px solid #2b3139;">
+                <td style="color:#f0b90b; padding:12px;"><b>{r['Symbol']}</b></td>
+                <td>{r['Time']}</td>
+                <td>{r['Entry']}</td>
+                <td style="color:{color};">{r['Current']}</td>
+                <td><span style="background:#2b3139; padding:2px 8px; border-radius:5px;">{r['Score']}</span></td>
+            </tr>"""
+    
+    return f"""<html><head><meta http-equiv="refresh" content="20">
+    <style>body{{background:#0b0e11;color:white;text-align:center;font-family:sans-serif;}} table{{width:90%;margin:auto;background:#1e2329;border-collapse:collapse;}} th{{padding:10px;color:#848e9c;}}</style>
+    </head><body>
+        <h2>📊 رادار التداول v86 (السكور 60+)</h2>
+        <table><thead><tr><th>العملة</th><th>الوقت</th><th>دخول</th><th>حالي</th><th>السكور</th></tr></thead>
+        <tbody>{rows}</tbody></table><br>
+        <a href="/download" style="color:#f0b90b; text-decoration:none; border:1px solid #f0b90b; padding:5px 10px; border-radius:5px;">📥 تحميل ملف CSV</a>
     </body></html>"""
 
 @app.route('/download')
 def download():
-    save_all_to_csv() # التأكد من الحفظ قبل التحميل
-    return send_file(CSV_FILE, as_attachment=True, mimetype='text/csv')
-
-# ======================== 4. التشغيل ========================
+    return send_file(CSV_FILE, as_attachment=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
-    asyncio.get_event_loop().run_until_complete(main_engine())
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+    asyncio.get_event_loop().run_until_complete(market_engine())
