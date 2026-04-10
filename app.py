@@ -7,158 +7,142 @@ import threading
 from flask import Flask
 from datetime import datetime
 
-# ======================== 1. الإعدادات والربط ========================
+# ======================== 1. الإعدادات والنسب ========================
 app = Flask('')
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 DESTINATIONS = ['5067771509', '-1003692815602']
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
+# نسب إدارة المخاطر
+TP_RATE = 0.03  # 3% ربح
+SL_RATE = 0.02  # 2% خسارة
+
 data_lock = threading.Lock()
 
-SYSTEM_STATE = {
-    'open_trades': [],   
-    'closed_trades': [], 
-    'radar_70': [],      # الجدول الجديد للعملات 70+
-    'last_full_sync': "جاري التحميل..."
-}
+class SharedState:
+    open_trades = []
+    last_update = "بانتظار البيانات..."
 
-# العتبات (Thresholds)
-RADAR_SCORE = 70   
-TRADE_SCORE = 85   
+state = SharedState()
 
-# ======================== 2. لوحة التحكم المطورة ========================
+# ======================== 2. واجهة الجدول المتطور ========================
 
 @app.route('/')
 def home():
     with data_lock:
-        open_list = list(SYSTEM_STATE['open_trades'])
-        closed_list = list(SYSTEM_STATE['closed_trades'])
-        radar_list = list(SYSTEM_STATE['radar_70'])
-        sync_time = SYSTEM_STATE['last_full_sync']
+        current_open = list(state.open_trades)
+        sync_time = state.last_update
 
-    # جدول الصفقات المفتوحة
-    open_rows = ""
-    for tr in reversed(open_list):
-        change = ((tr['current_price'] - tr['entry_price']) / tr['entry_price']) * 100
-        color = "#00ff00" if change >= 0 else "#ff4444"
-        open_rows += f"<tr><td>{tr['time']}</td><td><b>{tr['sym']}</b></td><td>{tr['entry_price']:.6f}</td><td>{tr['current_price']:.6f}</td><td style='color:{color}; font-weight:bold;'>{change:+.2f}%</td></tr>"
-
-    # جدول الرادار (70+) - الجديد
-    radar_rows = ""
-    for r in reversed(radar_list[-15:]):
-        radar_rows += f"<tr><td>{r['time']}</td><td>{r['sym']}</td><td style='color:#f0b90b;'>{r['score']}</td><td>{r['price']:.6f}</td></tr>"
-
-    # جدول الصفقات المغلقة
-    closed_rows = ""
-    for tr in reversed(closed_list[-10:]):
-        color = "#00ff00" if tr['final_pnl'] >= 0 else "#ff4444"
-        closed_rows += f"<tr><td>{tr['exit_time']}</td><td>{tr['sym']}</td><td>{tr['final_pnl']:+.2f}%</td></tr>"
+    rows = ""
+    for tr in reversed(current_open):
+        # حساب النسبة المئوية للحركة الحالية
+        pnl = ((tr['current_price'] - tr['entry_price']) / tr['entry_price']) * 100
+        pnl_color = "#00ff00" if pnl >= 0 else "#ff4444"
+        
+        rows += f"""
+        <tr>
+            <td style="color:#f0b90b;">{tr['time']}</td>
+            <td><b>{tr['sym']}</b></td>
+            <td>{tr['entry_price']:.6f}</td>
+            <td style="color:#00ff00; font-weight:bold;">{tr['tp']:.6f}</td>
+            <td style="color:#ff4444; font-weight:bold;">{tr['sl']:.6f}</td>
+            <td>{tr['current_price']:.6f}</td>
+            <td style="background:{pnl_color}; color:#000; font-weight:bold;">{pnl:+.2f}%</td>
+        </tr>"""
 
     return f"""
-    <html><head><meta http-equiv="refresh" content="20"><style>
-        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; text-align: center; padding: 10px; }}
-        .container {{ max-width: 1100px; margin: auto; }}
-        table {{ width: 100%; border-collapse: collapse; background: #1e2329; margin-bottom: 20px; border-radius: 8px; overflow: hidden; }}
-        th, td {{ padding: 10px; border: 1px solid #2b3139; text-align: center; }}
-        th {{ background: #2b3139; color: #f0b90b; }}
-        h2 {{ color: #f0b90b; text-align: left; border-left: 4px solid #f0b90b; padding-left: 10px; margin-top: 30px; }}
-        .header-box {{ background: #1e2329; padding: 10px; border-bottom: 3px solid #f0b90b; border-radius: 10px; }}
+    <html><head><meta http-equiv="refresh" content="10">
+    <style>
+        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; padding: 20px; }}
+        .card {{ background: #1e2329; padding: 20px; border-radius: 12px; border-top: 5px solid #f0b90b; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+        th, td {{ padding: 15px; border-bottom: 1px solid #2b3139; text-align: center; }}
+        th {{ color: #848e9c; font-size: 12px; text-transform: uppercase; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; }}
+        .sync-tag {{ font-size: 12px; color: #00ff00; }}
     </style></head><body>
-        <div class="container">
-            <div class="header-box">
-                <h1>🚀 Sniper Multi-Tracker v25</h1>
-                <p>آخر تحديث شامل: <span style="color:#00ff00;">{sync_time}</span></p>
+        <div class="card">
+            <div class="header">
+                <h2>🟢 الصفقات المفتوحة وأهداف التداول</h2>
+                <span class="sync-tag">تحديث السعر: {sync_time}</span>
             </div>
-
-            <h2>🟢 صفقات نشطة (85+)</h2>
             <table>
-                <thead><tr><th>وقت الدخول</th><th>العملة</th><th>الدخول</th><th>الحالي</th><th>PNL%</th></tr></thead>
-                <tbody>{open_rows if open_rows else "<tr><td colspan='5'>لا توجد صفقات مفتوحة</td></tr>"}</tbody>
-            </table>
-
-            <h2>📡 رادار المراقبة (70+)</h2>
-            <table>
-                <thead><tr><th>وقت الرصد</th><th>العملة</th><th>السكور</th><th>السعر</th></tr></thead>
-                <tbody>{radar_rows if radar_rows else "<tr><td colspan='4'>جاري البحث عن عملات قوية...</td></tr>"}</tbody>
-            </table>
-
-            <h2>🔴 سجل النتائج الأخيرة</h2>
-            <table>
-                <thead><tr><th>الوقت</th><th>العملة</th><th>النتيجة</th></tr></thead>
-                <tbody>{closed_rows if closed_rows else "<tr><td colspan='3'>لا توجد عمليات مغلقة</td></tr>"}</tbody>
+                <thead>
+                    <tr>
+                        <th>وقت الدخول</th>
+                        <th>الزوج</th>
+                        <th>سعر الدخول</th>
+                        <th>جني الأرباح (TP)</th>
+                        <th>وقف الخسارة (SL)</th>
+                        <th>السعر الحالي</th>
+                        <th>الحالة (PNL)</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows if rows else "<tr><td colspan='7'>لا توجد صفقات نشطة حالياً... جاري مسح السوق</td></tr>"}
+                </tbody>
             </table>
         </div>
     </body></html>"""
 
-# ======================== 3. المحرك الفني والمزامنة ========================
+# ======================== 3. محرك البحث الذكي ========================
 
-async def calculate_logic_v25(sym):
-    try:
-        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=100)
-        df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
-        score = 0
-        curr_p = df['close'].iloc[-1]
-        
-        # 1. بولنجر (40)
-        std = df['close'].rolling(20).std(); ma20 = df['close'].rolling(20).mean()
-        if ((4 * std) / (ma20 + 1e-9)).iloc[-1] < 0.05: score += 40
-        # 2. متوسطات (20)
-        ma9 = df['close'].rolling(9).mean().iloc[-1]; ma200 = df['close'].rolling(200).mean().iloc[-1]
-        if curr_p > ma200: score += 10
-        if curr_p > ma9: score += 10
-        # 3. سيولة (20) + RSI (20)
-        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1]: score += 20
-        delta = df['close'].diff(); g = delta.where(delta>0,0).rolling(14).mean(); l = -delta.where(delta<0,0).rolling(14).mean()
-        rsi = 100 - (100 / (1 + (g/(l+1e-9)))).iloc[-1]
-        if 50 < rsi < 70: score += 20
-        
-        return int(score), curr_p
-    except: return 0, 0
-
-async def scanner_loop():
+async def analyze_market():
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
             symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
             
             for sym in symbols:
-                score, price = await calculate_logic_v25(sym)
+                # محاكاة تحليل السكور (اختصاراً للوقت)
+                bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=50)
+                df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
+                current_p = df['close'].iloc[-1]
+                
+                # حساب سكور بسيط (بولنجر + سيولة)
+                std = df['close'].rolling(20).std(); ma = df['close'].rolling(20).mean()
+                is_squeeze = ((4 * std) / ma).iloc[-1] < 0.05
+                vol_spike = df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.5
                 
                 with data_lock:
-                    SYSTEM_STATE['last_full_sync'] = datetime.now().strftime('%H:%M:%S')
-
-                    # تحديث أسعار المفتوح
-                    for tr in SYSTEM_STATE['open_trades']:
+                    state.last_update = datetime.now().strftime('%H:%M:%S')
+                    
+                    # تحديث السعر الحالي للصفقات المفتوحة
+                    for tr in state.open_trades:
                         if tr['sym'] == sym:
-                            tr['current_price'] = price
-                            pnl = ((price - tr['entry_price']) / tr['entry_price']) * 100
-                            if pnl >= 3.0 or pnl <= -2.0:
-                                SYSTEM_STATE['closed_trades'].append({'sym':sym,'final_pnl':pnl,'exit_time':SYSTEM_STATE['last_full_sync']})
-                                SYSTEM_STATE['open_trades'].remove(tr)
+                            tr['current_price'] = current_p
 
-                    # إضافة للرادار (70+)
-                    if score >= RADAR_SCORE:
-                        if sym not in [x['sym'] for x in SYSTEM_STATE['radar_70'][-15:]]:
-                            SYSTEM_STATE['radar_70'].append({'sym':sym, 'score':score, 'price':price, 'time':SYSTEM_STATE['last_full_sync']})
-                            if len(SYSTEM_STATE['radar_70']) > 30: SYSTEM_STATE['radar_70'].pop(0)
-
-                    # دخول صفقة (85+)
-                    if score >= TRADE_SCORE:
-                        if sym not in [x['sym'] for x in SYSTEM_STATE['open_trades']]:
-                            SYSTEM_STATE['open_trades'].append({'sym':sym, 'entry_price':price, 'current_price':price, 'time':SYSTEM_STATE['last_full_sync']})
-                            send_telegram(f"✅ دخول صفقة: {sym} (السكور: {score})")
-
-                await asyncio.sleep(0.04)
-            await asyncio.sleep(300)
+                    # شرط الدخول: انضغاط + سيولة
+                    if is_squeeze and vol_spike:
+                        if sym not in [x['sym'] for x in state.open_trades]:
+                            # حساب القيم المالية
+                            tp_price = current_p * (1 + TP_RATE)
+                            sl_price = current_p * (1 - SL_RATE)
+                            entry_time = state.last_update
+                            
+                            # إضافة للجدول (الكتابة أولاً)
+                            state.open_trades.append({
+                                'sym': sym, 'entry_price': current_p, 'current_price': current_p,
+                                'tp': tp_price, 'sl': sl_price, 'time': entry_time
+                            })
+                            
+                            # إرسال التلجرام
+                            msg = (f"🚀 *إشارة دخول*\nالعملة: {sym}\nالدخول: {current_p:.6f}\n"
+                                   f"🎯 الهدف: {tp_price:.6f}\n🛑 الوقف: {sl_price:.6f}\n⏰ الوقت: {entry_time}")
+                            send_telegram(msg)
+                
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(120)
         except Exception as e:
-            print(f"Error: {e}"); await asyncio.sleep(60)
+            print(f"Error: {e}"); await asyncio.sleep(30)
 
 def send_telegram(msg):
     for cid in DESTINATIONS:
-        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": cid, "text": msg})
+        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                           json={"chat_id": cid, "text": msg, "parse_mode": "Markdown"})
         except: pass
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port, use_reloader=False), daemon=True).start()
-    asyncio.get_event_loop().run_until_complete(scanner_loop())
+    asyncio.get_event_loop().run_until_complete(analyze_market())
