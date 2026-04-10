@@ -7,124 +7,98 @@ import threading
 from flask import Flask
 from datetime import datetime
 
-# ======================== 1. إعداد قاعدة البيانات SQL ========================
+# ======================== 1. إعداد قاعدة البيانات ========================
 app = Flask(__name__)
-DB_PATH = "/tmp/trading_signals_v102.db"
+DB_PATH = "/tmp/test_radar_v103.db"
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS signals 
-            (symbol TEXT PRIMARY KEY, 
-             entry_price REAL, 
-             current_price REAL, 
-             score INTEGER,
-             time TEXT)''')
-    print("✅ قاعدة بيانات SQL جاهزة.")
+        conn.execute("DROP TABLE IF EXISTS signals") # مسح البيانات القديمة عند كل تشغيل للتجربة
+        conn.execute('''CREATE TABLE signals 
+            (symbol TEXT PRIMARY KEY, entry_price REAL, current_price REAL, score INTEGER, time TEXT)''')
+    print("⚠️ نظام التجربة جاهز: سيتم رصد العملات بسرعة الآن.")
 
 init_db()
-
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
-data_lock = threading.Lock()
 
-# ======================== 2. محرك التحليل التقني ========================
+# ======================== 2. محرك الفحص السريع ========================
 
-async def analyze_market(sym):
+async def fast_analyze(sym):
     try:
-        # جلب البيانات للتحليل (البولنجر + RSI + الفوليوم)
-        bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='1h', limit=40)
-        df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-        close = df['close']
+        # لجعل التجربة سريعة، سنأخذ السعر الحالي ونعطي سكور عشوائي فوق 10
+        ticker = await EXCHANGE.fetch_ticker(sym)
+        price = ticker['last']
+        change = ticker['percentage']
         
-        # حساب السكور
-        score = 0
-        # 1. ضغط البولنجر (Squeeze)
-        ma20 = close.rolling(20).mean()
-        std20 = close.rolling(20).std()
-        bw = ((ma20 + 2*std20) - (ma20 - 2*std20)) / ma20
-        if bw.iloc[-1] < 0.045: score += 40
-        
-        # 2. القوة النسبية (RSI)
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-        if 50 < rsi.iloc[-1] < 75: score += 30
-        
-        # 3. الفوليوم
-        if df['vol'].iloc[-1] > df['vol'].rolling(20).mean().iloc[-1] * 1.5: score += 30
-        
-        return int(score), close.iloc[-1]
+        # سكور تجريبي: أي عملة تتحرك ولو قليلاً ستحصل على سكور
+        test_score = 50 if abs(change) > 0.1 else 15
+        return test_score, price
     except: return 0, 0
-
-# ======================== 3. المحرك الرئيسي (تحديث SQL) ========================
 
 async def main_engine():
     while True:
         try:
+            # سنفحص أول 20 عملة فقط لتكون النتائج فورية
             tickers = await EXCHANGE.fetch_tickers()
-            symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s and 'DOWN/' not in s]
+            all_symbols = [s for s in tickers.keys() if '/USDT' in s and 'UP/' not in s][:30]
             
-            for sym in symbols:
+            for sym in all_symbols:
                 current_price = tickers[sym]['last']
                 
-                # تحديث الأسعار الحالية للعملات الموجودة مسبقاً في SQL
+                # تحديث الأسعار في SQL
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.execute("UPDATE signals SET current_price = ? WHERE symbol = ?", (current_price, sym))
                 
-                # فحص العملات الجديدة لإضافتها
-                score, entry_price = await analyze_market(sym)
+                # إضافة عملات جديدة بسرعة (سكور منخفض للتجربة)
+                score, entry_price = await fast_analyze(sym)
                 
-                if score >= 70:
+                if score >= 10: # شرط سهل جداً للتأكد من عمل الكود
                     now = datetime.now().strftime('%H:%M:%S')
                     with sqlite3.connect(DB_PATH) as conn:
-                        # إضافة العملة فقط إذا لم تكن موجودة
                         conn.execute('''INSERT OR IGNORE INTO signals (symbol, entry_price, current_price, score, time) 
                                       VALUES (?, ?, ?, ?, ?)''', (sym, entry_price, current_price, score, now))
                 
-                await asyncio.sleep(0.01) # منع الحظر
+                await asyncio.sleep(0.01)
             
-            await asyncio.sleep(20)
-        except: await asyncio.sleep(10)
+            await asyncio.sleep(5) # تحديث سريع كل 5 ثوانٍ
+        except Exception as e:
+            print(f"Error: {e}")
+            await asyncio.sleep(5)
 
-# ======================== 4. واجهة الموقع (الأعمدة المطلوبة) ========================
+# ======================== 3. الموقع التجريبي ========================
 
 @app.route('/')
-def dashboard():
+def test_dashboard():
     rows = ""
     with sqlite3.connect(DB_PATH) as conn:
-        # عرض آخر 15 عملة تم رصدها
-        cursor = conn.execute("SELECT * FROM signals ORDER BY time DESC LIMIT 15")
+        cursor = conn.execute("SELECT * FROM signals ORDER BY time DESC")
         for r in cursor:
-            # حساب الربح/الخسارة لتلوين السعر الحالي
-            pnl_color = "#00ff00" if r[2] >= r[1] else "#ff4444"
+            pnl = ((r[2] - r[1]) / r[1] * 100)
+            pnl_color = "#00ff00" if pnl >= 0 else "#ff4444"
             rows += f"""
             <tr style="border-bottom: 1px solid #2b3139;">
-                <td style="color:#f0b90b; font-weight:bold; padding:15px;">{r[0]}</td>
-                <td>{r[1]:.6f}</td>
-                <td style="color:{pnl_color}; font-weight:bold;">{r[2]:.6f}</td>
-                <td><span style="background:#363a45; padding:3px 12px; border-radius:15px;">{r[3]}</span></td>
+                <td style="color:#f0b90b; font-weight:bold; padding:12px;">{r[0]}</td>
+                <td>{r[1]:.4f}</td>
+                <td style="color:{pnl_color};">{r[2]:.4f}</td>
+                <td><b style="color:#f0b90b;">{r[3]}</b></td>
                 <td style="font-size:0.8em; color:#848e9c;">{r[4]}</td>
             </tr>"""
 
     return f"""
-    <html><head><meta http-equiv="refresh" content="10">
+    <html><head><meta http-equiv="refresh" content="5">
     <style>
-        body {{ background: #0b0e11; color: #eaecef; font-family: sans-serif; text-align: center; padding: 20px; }}
-        .card {{ max-width: 900px; margin: auto; background: #1e2329; border-radius: 12px; padding: 20px; border-top: 5px solid #f0b90b; }}
+        body {{ background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 20px; }}
+        .box {{ max-width: 800px; margin: auto; background: #1e2329; padding: 20px; border-radius: 10px; border: 2px solid #f0b90b; }}
         table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
-        th {{ color: #848e9c; padding: 12px; border-bottom: 2px solid #2b3139; }}
-        td {{ padding: 12px; }}
+        th {{ color: #848e9c; padding: 10px; border-bottom: 2px solid #2b3139; }}
+        td {{ padding: 10px; }}
     </style></head><body>
-        <div class="card">
-            <h2 style="margin-bottom:5px;">📊 رادار التداول SQL</h2>
-            <p style="color:#848e9c; font-size:0.9em;">(التحليل الفني: بولنجر + RSI + سيولة)</p>
+        <div class="box">
+            <h2>🧪 وضع الاختبار التجريبي (Test Mode)</h2>
+            <p style="color:#00ff00;">إذا ظهرت عملات بالأسفل، فإن الكود يعمل بشكل سليم!</p>
             <table>
-                <thead>
-                    <tr><th>اسم العملة</th><th>سعر الدخول</th><th>السعر الحالي</th><th>السكور</th><th>التوقيت</th></tr>
-                </thead>
-                <tbody>
-                    {rows if rows else "<tr><td colspan='5' style='padding:30px;'>🔎 جاري تحليل أزواج USDT...</td></tr>"}
-                </tbody>
+                <thead><tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>السكور</th><th>التوقيت</th></tr></thead>
+                <tbody>{rows if rows else "<tr><td colspan='5'>جاري ملء الجدول فوراً...</td></tr>"}</tbody>
             </table>
         </div>
     </body></html>"""
