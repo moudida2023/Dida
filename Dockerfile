@@ -1,28 +1,26 @@
-# 1. استخدام نسخة خفيفة ومستقرة من بايثون
+# استخدام نسخة بايثون خفيفة ومستقرة
 FROM python:3.10-slim
 
-# 2. تعيين مجلد العمل داخل الحاوية
-WORKDIR /app
-
-# 3. تثبيت أدوات النظام الضرورية (لضمان عمل pandas و ccxt)
+# تثبيت الأدوات اللازمة للتعامل مع PostgreSQL داخل النظام
 RUN apt-get update && apt-get install -y \
-    build-essential \
+    libpq-dev \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# 4. نسخ ملف المتطلبات وتثبيته
-# تأكد من وجود ملف requirements.txt بجانب الـ Dockerfile
+# تحديد مجلد العمل داخل الحاوية
+WORKDIR /app
+
+# نسخ ملف المكتبات أولاً لتسريع عملية البناء
 COPY requirements.txt .
+
+# تثبيت مكتبات بايثون
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. نسخ جميع ملفات المشروع إلى الحاوية
+# نسخ باقي ملفات المشروع إلى الحاوية
 COPY . .
 
-# 6. تعيين المتغيرات البيئية (اختياري لضمان عدم تخزين ملفات pyc)
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+# تحديد المنفذ (Port) الذي سيعمل عليه Flask
+EXPOSE 10000
 
-# 7. فتح المنفذ الذي يستخدمه Flask
-EXPOSE 8080
-
-# 8. أمر التشغيل (تأكد أن اسم ملفك البرمجي هو main.py أو استبدله بالاسم الصحيح)
+# أمر تشغيل البوت
 CMD ["python", "app.py"]
