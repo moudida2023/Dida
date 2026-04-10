@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED 1
 EXPOSE 8080
 
 # 8. أمر التشغيل (تأكد أن اسم ملفك البرمجي هو main.py أو استبدله بالاسم الصحيح)
-CMD ["python", "main.py"]
+CMD ["python", "app.py"]
