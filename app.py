@@ -8,9 +8,9 @@ import threading
 from flask import Flask, render_template_string, redirect, url_for
 from datetime import datetime
 
-# ======================== 1. الإعدادات العامة ========================
+# ======================== 1. الإعدادات ========================
 app = Flask(__name__)
-SCAN_HISTORY = []  # قائمة لتخزين سجل آخر عمليات المسح
+SCAN_HISTORY = [] 
 
 DB_URL = os.environ.get('DATABASE_URL')
 if DB_URL and DB_URL.startswith("postgres://"):
@@ -18,21 +18,27 @@ if DB_URL and DB_URL.startswith("postgres://"):
 
 INITIAL_BALANCE = 1000.0
 MAX_OPEN_TRADES = 30
-ENTRY_SCORE_THRESHOLD = 70
+ENTRY_SCORE_THRESHOLD = 80 # سكور الدخول الصارم
+
+# العملات المستبعدة (AI وغيرها)
+EXCLUDED_KEYWORDS = ['FET', 'AGIX', 'OCEAN', 'RNDR', 'NEAR', 'GRT', 'INJ', 'THETA', 'AKT', 'ROSE', 'ORAI', 'PHB', 'NMR', 'AIT', 'GLM', 'TAO']
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode='require')
 
-# ======================== 2. المحرك مع سجلات المسح ========================
+# ======================== 2. المحرك المطور للدخول المتعدد ========================
 
 async def perform_analysis(sym, exchange_instance):
+    base_symbol = sym.split('/')[0] if '/' in sym else sym
+    if any(k in base_symbol for k in EXCLUDED_KEYWORDS):
+        return None
     try:
         bars = await exchange_instance.fetch_ohlcv(sym, timeframe='1h', limit=30)
         if not bars or len(bars) < 20: return None
         df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
         close = df['close']; volume = df['vol']; score = 0
         
-        # تحليل الحجم والبولينجر و RSI
+        # تحليل فني مكثف
         avg_vol = volume.iloc[-21:-1].mean()
         if volume.iloc[-1] > (avg_vol * 1.5): score += 40
         ma20 = close.rolling(20).mean(); std20 = close.rolling(20).std()
@@ -61,70 +67,81 @@ async def main_engine():
                 tasks = [perform_analysis(sym, EXCHANGE) for sym in batch]
                 batch_results = await asyncio.gather(*tasks)
                 all_results.extend([r for r in batch_results if r is not None])
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
 
-            # تحديد أفضل عملة في المسح الحالي
-            best_now = "لا يوجد"
+            # --- التعديل الجوهري: الدخول في كل عملة تحقق الشرط فوراً ---
+            found_this_turn = 0
+            best_score_val = 0
+            best_sym_val = "لا يوجد"
+
             if all_results:
-                top_hit = max(all_results, key=lambda x: x['score'])
-                best_now = f"{top_hit['symbol']} ({top_hit['score']})"
-                
-                # تنفيذ الصفقات إذا تحقق السكور
                 conn = get_db_connection(); cur = conn.cursor()
-                for hit in [h for h in all_results if h['score'] >= ENTRY_SCORE_THRESHOLD]:
-                    cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
-                    if cur.fetchone()[0] >= MAX_OPEN_TRADES: break
-                    cur.execute("SELECT COUNT(*) FROM trades WHERE symbol = %s AND status = 'OPEN'", (hit['symbol'],))
-                    if cur.fetchone()[0] == 0:
-                        cur.execute("INSERT INTO trades (symbol, entry_price, current_price, take_profit, stop_loss, investment, status, score, open_time, date_added) VALUES (%s, %s, %s, %s, %s, 50, 'OPEN', %s, %s, %s)", 
-                                   (hit['symbol'], hit['price'], hit['price'], hit['price']*1.02, hit['price']*0.97, hit['score'], datetime.now().strftime('%H:%M:%S'), datetime.now().date()))
+                
+                # ترتيب النتائج من الأعلى سكوراً للأقل
+                sorted_hits = sorted(all_results, key=lambda x: x['score'], reverse=True)
+                if sorted_hits:
+                    best_score_val = sorted_hits[0]['score']
+                    best_sym_val = sorted_hits[0]['symbol']
+
+                for hit in sorted_hits:
+                    if hit['score'] >= ENTRY_SCORE_THRESHOLD:
+                        # التأكد من عدم تجاوز الحد الأقصى للصفقات
+                        cur.execute("SELECT COUNT(*) FROM trades WHERE status = 'OPEN'")
+                        if cur.fetchone()[0] >= MAX_OPEN_TRADES: break
+                        
+                        # التأكد أن العملة ليست مفتوحة مسبقاً
+                        cur.execute("SELECT COUNT(*) FROM trades WHERE symbol = %s AND status = 'OPEN'", (hit['symbol'],))
+                        if cur.fetchone()[0] == 0:
+                            cur.execute("INSERT INTO trades (symbol, entry_price, current_price, take_profit, stop_loss, investment, status, score, open_time, date_added) VALUES (%s, %s, %s, %s, %s, 50, 'OPEN', %s, %s, %s)", 
+                                       (hit['symbol'], hit['price'], hit['price'], hit['price']*1.02, hit['price']*0.97, hit['score'], datetime.now().strftime('%H:%M:%S'), datetime.now().date()))
+                            found_this_turn += 1
+                
                 conn.commit(); cur.close(); conn.close()
 
-            # إضافة عملية المسح للسجل
+            # تسجيل نشاط المسح
             SCAN_HISTORY.insert(0, {
                 'time': start_t.strftime('%H:%M:%S'),
-                'count': len(top_500),
-                'best': best_now,
-                'found': len([h for h in all_results if h['score'] >= ENTRY_SCORE_THRESHOLD])
+                'best': f"{best_sym_val} ({best_score_val})",
+                'found': found_this_turn
             })
-            SCAN_HISTORY = SCAN_HISTORY[:10] # احتفاظ بآخر 10 مسحات فقط
+            SCAN_HISTORY = SCAN_HISTORY[:10]
 
-            await asyncio.sleep(10)
-        except Exception as e:
-            print(f"Error: {e}"); await asyncio.sleep(10)
+            await asyncio.sleep(15)
+        except: await asyncio.sleep(10)
 
-# ======================== 3. لوحة التحكم المطورة ========================
+# ======================== 3. الواجهة ========================
 
 @app.route('/')
 def index():
-    conn = get_db_connection(); cur = conn.cursor(cursor_factory=extras.DictCursor)
-    cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY open_time DESC")
-    opens = cur.fetchall()
-    cur.close(); conn.close()
+    try:
+        conn = get_db_connection(); cur = conn.cursor(cursor_factory=extras.DictCursor)
+        cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY open_time DESC")
+        opens = cur.fetchall()
+        cur.close(); conn.close()
+    except: opens = []
 
     html = """
     <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
-    <title>Scanner Monitor v149</title><style>
+    <title>Multi-Entry Bot v151</title><style>
         body { background: #0b0e11; color: white; font-family: sans-serif; padding: 20px; direction: rtl; }
         .grid { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
-        .box { background: #1e2329; padding: 15px; border-radius: 8px; }
+        .box { background: #1e2329; padding: 15px; border-radius: 8px; border-top: 3px solid #0ecb81; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
-        th, td { padding: 8px; text-align: center; border-bottom: 1px solid #2b3139; }
-        th { color: #848e9c; }
-        .highlight { color: #f0b90b; font-weight: bold; }
-        .success { color: #0ecb81; }
+        th, td { padding: 10px; text-align: center; border-bottom: 1px solid #2b3139; }
+        .highlight { color: #f0b90b; }
+        .count-badge { background: #0ecb81; color: black; padding: 2px 8px; border-radius: 10px; font-weight: bold; }
     </style></head><body>
-        <h1>🛰️ نظام المراقبة والتحليل المباشر</h1>
+        <h1>🚀 رادار الاقتناص المتعدد (v151)</h1>
         <div class="grid">
             <div class="box">
-                <h3>🔍 سجل عمليات المسح (آخر 10)</h3>
+                <h3>📊 سجل المسح (Multi-Scan)</h3>
                 <table>
-                    <tr><th>الوقت</th><th>العملات</th><th>أفضل سكور</th><th>أهداف</th></tr>
+                    <tr><th>الوقت</th><th>أفضل سكور</th><th>تم الدخول</th></tr>
                     {% for s in scans %}
                     <tr>
-                        <td>{{ s.time }}</td><td>{{ s.count }}</td>
+                        <td>{{ s.time }}</td>
                         <td class="highlight">{{ s.best }}</td>
-                        <td class="success">{{ s.found }}</td>
+                        <td><span class="count-badge">+{{ s.found }}</span></td>
                     </tr>
                     {% endfor %}
                 </table>
@@ -132,13 +149,15 @@ def index():
             <div class="box">
                 <h3>🔓 الصفقات المفتوحة حالياً ({{ opens|length }})</h3>
                 <table>
-                    <tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>الربح %</th></tr>
+                    <tr><th>العملة</th><th>الدخول</th><th>الربح %</th><th>السكور</th></tr>
                     {% for t in opens %}
                     <tr>
-                        <td><b>{{ t.symbol }}</b></td><td>{{ t.entry_price }}</td><td>{{ t.current_price }}</td>
+                        <td><b>{{ t.symbol }}</b></td>
+                        <td>{{ "%.4f"|format(t.entry_price) }}</td>
                         <td style="color: {{ '#0ecb81' if t.current_price >= t.entry_price else '#f6465d' }}">
                             {{ "%+.2f"|format(((t.current_price-t.entry_price)/t.entry_price)*100) }}%
                         </td>
+                        <td class="highlight">{{ t.score }}</td>
                     </tr>
                     {% endfor %}
                 </table>
