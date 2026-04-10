@@ -8,30 +8,29 @@ import threading
 from flask import Flask, render_template_string
 from datetime import datetime
 
-# ======================== 1. الإعدادات والربط ========================
 app = Flask(__name__)
 
+# إعدادات قاعدة البيانات
 DB_URL = os.environ.get('DATABASE_URL')
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-INITIAL_BALANCE = 500.0 # الرصيد الافتراضي كما طلبت
+INITIAL_BALANCE = 500.0  # الرصيد الابتدائي
 
 def get_db_connection():
     return psycopg2.connect(DB_URL, sslmode='require')
 
-# ======================== 2. محرك إدارة الصفقات والمحفظة v159 ========================
+# ======================== المحرك البرمجي ========================
 
 async def main_engine():
-    # إعادة تهيئة الجدول مع إضافة عمود الاستثمار
+    # تهيئة الجدول وتطهير البيانات القديمة لضمان الدقة
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS trades")
         cur.execute('''CREATE TABLE trades 
             (symbol TEXT PRIMARY KEY, entry_price REAL, current_price REAL, 
-             tp REAL, sl REAL, score INTEGER, open_time TEXT, 
-             investment REAL, status TEXT)''')
+             tp REAL, sl REAL, investment REAL, open_time TEXT)''')
         conn.commit()
         cur.close(); conn.close()
     except: pass
@@ -41,39 +40,33 @@ async def main_engine():
     while True:
         try:
             tickers = await EXCHANGE.fetch_tickers()
-            # فحص العملات الأكثر سيولة في USDT
-            valid_symbols = [s for s in tickers if '/USDT' in s]
-            top_symbols = sorted(valid_symbols, key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:50]
+            # جلب أفضل 40 عملة من حيث حجم التداول
+            top_symbols = sorted([s for s in tickers if '/USDT' in s], 
+                               key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:40]
             
             conn = get_db_connection()
             cur = conn.cursor()
 
             for sym in top_symbols:
                 price = tickers[sym]['last']
-                # حساب أهداف ذكية: ربح 2% ووقف 3%
-                tp_price = price * 1.02
-                sl_price = price * 0.97
-                
-                # إدخال الصفقات (محاكاة دخول بمبلغ 50 دولار لكل صفقة)
-                cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, tp, sl, score, open_time, investment, status) 
-                               VALUES (%s, %s, %s, %s, %s, 85, %s, 50.0, 'OPEN') 
+                # حساب الأهداف تلقائياً
+                cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, tp, sl, investment, open_time) 
+                               VALUES (%s, %s, %s, %s, %s, 50.0, %s) 
                                ON CONFLICT (symbol) DO UPDATE SET current_price = EXCLUDED.current_price""", 
-                            (sym, price, price, tp_price, sl_price, datetime.now().strftime('%H:%M:%S')))
+                            (sym, price, price, price*1.02, price*0.97, datetime.now().strftime('%H:%M:%S')))
             
             conn.commit()
             cur.close(); conn.close()
-            await asyncio.sleep(8) 
-        except Exception as e:
+            await asyncio.sleep(10) 
+        except:
             await asyncio.sleep(10)
 
-# ======================== 3. واجهة المحفظة والصفقات ========================
+# ======================== الواجهة الرسومية ========================
 
 @app.route('/')
 def index():
     trades = []
-    total_unrealized_pnl = 0
-    active_investments = 0
-    
+    total_pnl = 0
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.DictCursor)
@@ -81,40 +74,77 @@ def index():
         trades = cur.fetchall()
         cur.close(); conn.close()
         
-        # حساب إحصائيات المحفظة
         for t in trades:
-            pnl = ((t['current_price'] - t['entry_price']) / t['entry_price']) * t['investment']
-            total_unrealized_pnl += pnl
-            active_investments += t['investment']
+            total_pnl += ((t['current_price'] - t['entry_price']) / t['entry_price']) * t['investment']
     except: pass
 
-    html = """
-    <!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="5">
-    <title>Portfolio Manager v159</title>
-    <style>
-        body { background: #0b0e11; color: white; font-family: 'Segoe UI', sans-serif; padding: 20px; direction: rtl; }
-        .dashboard { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: #1e2329; padding: 20px; border-radius: 12px; border-bottom: 4px solid #f0b90b; text-align: center; }
-        .stat-val { font-size: 24px; font-weight: bold; margin-top: 10px; }
-        .profit { color: #0ecb81; } .loss { color: #f6465d; }
-        table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 12px; overflow: hidden; }
-        th { background: #2b3139; color: #848e9c; padding: 15px; font-size: 13px; text-align: center; }
-        td { padding: 15px; text-align: center; border-bottom: 1px solid #2b3139; }
-        .symbol-tag { background: #474d57; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
-    </style></head><body>
-        <div style="max-width: 1200px; margin: auto;">
-            <h1 style="color: #f0b90b;">🛰️ رادار الصفقات وحالة المحفظة</h1>
-            
-            <div class="dashboard">
-                <div class="stat-card">
-                    <div style="color: #848e9c;">الرصيد الافتراضي</div>
-                    <div class="stat-val">${{ "%.2f"|format(500 + total_unrealized_pnl) }}</div>
-                </div>
-                <div class="stat-card">
-                    <div style="color: #848e9c;">إجمالي الأرباح/الخسائر</div>
-                    <div class="stat-val {{ 'profit' if total_unrealized_pnl >= 0 else 'loss' }}">
-                        {{ "%+.2f"|format(total_unrealized_pnl) }} USDT
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div style="color: #848
+    # تم إصلاح إغلاق النصوص هنا لتجنب SyntaxError
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="5">
+        <title>Portfolio Dashboard</title>
+        <style>
+            body { background: #0b0e11; color: white; font-family: sans-serif; padding: 20px; }
+            .header { display: flex; justify-content: space-around; background: #1e2329; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-bottom: 4px solid #f0b90b; }
+            .stat-box { text-align: center; }
+            .stat-label { color: #848e9c; font-size: 14px; }
+            .stat-value { font-size: 22px; font-weight: bold; margin-top: 5px; }
+            table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 10px; overflow: hidden; }
+            th { background: #2b3139; padding: 15px; color: #848e9c; }
+            td { padding: 15px; text-align: center; border-bottom: 1px solid #2b3139; }
+            .up { color: #0ecb81; } .down { color: #f6465d; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="stat-box">
+                <div class="stat-label">رصيد المحفظة الحي</div>
+                <div class="stat-value">${{ "%.2f"|format(500 + total_pnl) }}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">إجمالي الربح/الخسارة</div>
+                <div class="stat-value {{ 'up' if total_pnl >= 0 else 'down' }}">${{ "%.2f"|format(total_pnl) }}</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">الصفقات المفتوحة</div>
+                <div class="stat-value">{{ trades|length }}</div>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>العملة</th>
+                    <th>سعر الدخول</th>
+                    <th>السعر الحالي</th>
+                    <th>الربح %</th>
+                    <th>الاستثمار</th>
+                    <th>الوقت</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in trades %}
+                {% set pct = ((t.current_price - t.entry_price) / t.entry_price) * 100 %}
+                <tr>
+                    <td><b>{{ t.symbol }}</b></td>
+                    <td>{{ "%.4f"|format(t.entry_price) }}</td>
+                    <td style="color: #f0b90b;">{{ "%.4f"|format(t.current_price) }}</td>
+                    <td class="{{ 'up' if pct >= 0 else 'down' }}">{{ "%+.2f"|format(pct) }}%</td>
+                    <td>${{ t.investment }}</td>
+                    <td style="color: #848e9c;">{{ t.open_time }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+    return render_template_string(html_template, trades=trades, total_pnl=total_pnl)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=lambda: asyncio.run(main_engine()), daemon=True).start()
+    app.run(host='0.0.0.0', port=port)
