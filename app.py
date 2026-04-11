@@ -15,58 +15,40 @@ exchange_status = "🔴"
 
 def get_db_connection():
     try:
-        return psycopg2.connect(DB_URL, sslmode='require', connect_timeout=10)
+        # التأكد من أن الرابط نصي (String) وإضافة SSL
+        url = str(DB_URL).strip()
+        conn = psycopg2.connect(url, sslmode='require', connect_timeout=10)
+        return conn
     except Exception as e:
-        print(f"❌ Database Connection Error: {e}")
+        print(f"❌ DB connection failed: {e}")
         return None
 
-# --- تهيئة الجداول (الحل الجذري لخطأ 500) ---
-def init_db_structure():
-    conn = get_db_connection()
-    if conn:
-        try:
-            cur = conn.cursor()
-            # 1. جدول الصفقات المفتوحة
-            cur.execute('''CREATE TABLE IF NOT EXISTS trades 
-                (symbol TEXT PRIMARY KEY, entry_price DOUBLE PRECISION, current_price DOUBLE PRECISION, 
-                 tp_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, investment DOUBLE PRECISION, open_time TEXT)''')
-            # 2. جدول الصفقات المغلقة
-            cur.execute('''CREATE TABLE IF NOT EXISTS closed_trades 
-                (id SERIAL PRIMARY KEY, symbol TEXT, entry_price DOUBLE PRECISION, exit_price DOUBLE PRECISION, 
-                 pnl DOUBLE PRECISION, exit_reason TEXT, close_time TEXT)''')
-            # 3. جدول المحفظة
-            cur.execute('''CREATE TABLE IF NOT EXISTS wallet (id INT PRIMARY KEY, balance DOUBLE PRECISION)''')
-            cur.execute("INSERT INTO wallet (id, balance) VALUES (1, 0) ON CONFLICT DO NOTHING")
-            
-            conn.commit()
-            cur.close(); conn.close()
-            print("✅ Database structure verified and initialized.")
-        except Exception as e:
-            print(f"❌ Error initializing DB: {e}")
-
-# --- وظيفة الإغلاق الموحدة ---
+# --- وظيفة الإغلاق الموحدة مع معالجة الأخطاء ---
 def close_position(symbol, exit_price, reason):
     conn = get_db_connection()
-    if not conn: return False
+    if conn is None: return False
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
-        cur.execute("SELECT * FROM trades WHERE symbol = %s", (symbol,))
+        cur.execute("SELECT * FROM trades WHERE symbol = %s", (str(symbol),))
         trade = cur.fetchone()
         if trade:
-            pnl = ((exit_price - trade['entry_price']) / trade['entry_price']) * trade['investment']
-            cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (symbol, trade['entry_price'], exit_price, pnl, reason, datetime.now().strftime('%Y-%m-%d %H:%M')))
+            pnl = ((float(exit_price) - trade['entry_price']) / trade['entry_price']) * trade['investment']
+            cur.execute("""INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) 
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (symbol, trade['entry_price'], float(exit_price), pnl, reason, datetime.now().strftime('%Y-%m-%d %H:%M')))
             cur.execute("UPDATE wallet SET balance = balance + %s WHERE id = 1", (pnl,))
             cur.execute("DELETE FROM trades WHERE symbol = %s", (symbol,))
             conn.commit()
         cur.close(); conn.close()
         return True
-    except: return False
+    except Exception as e:
+        print(f"❌ Close Error: {e}")
+        if conn: conn.rollback(); conn.close()
+        return False
 
-# --- المحرك الخلفي ---
+# --- محرك التداول ---
 async def trading_engine():
     global exchange_status
-    init_db_structure()
     exchange = ccxt.gateio({'enableRateLimit': True})
     while True:
         try:
@@ -74,10 +56,17 @@ async def trading_engine():
             exchange_status = "🟢"
             conn = get_db_connection()
             if conn:
-                cur = conn.cursor(extras.DictCursor)
+                cur = conn.cursor(cursor_factory=extras.DictCursor)
+                # التأكد من وجود الجداول
+                cur.execute("CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, entry_price DOUBLE PRECISION, current_price DOUBLE PRECISION, tp_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, investment DOUBLE PRECISION, open_time TEXT)")
+                cur.execute("CREATE TABLE IF NOT EXISTS closed_trades (id SERIAL PRIMARY KEY, symbol TEXT, entry_price DOUBLE PRECISION, exit_price DOUBLE PRECISION, pnl DOUBLE PRECISION, exit_reason TEXT, close_time TEXT)")
+                cur.execute("CREATE TABLE IF NOT EXISTS wallet (id INT PRIMARY KEY, balance DOUBLE PRECISION)")
+                cur.execute("INSERT INTO wallet (id, balance) VALUES (1, 0) ON CONFLICT DO NOTHING")
+                
                 cur.execute("SELECT * FROM trades")
                 active_trades = cur.fetchall()
                 tickers = await exchange.fetch_tickers()
+                
                 for t in active_trades:
                     sym = t['symbol']
                     if sym in tickers:
@@ -88,18 +77,20 @@ async def trading_engine():
                 conn.commit()
                 cur.close(); conn.close()
             await asyncio.sleep(20)
-        except:
+        except Exception as e:
+            print(f"⚠️ Engine Error: {e}")
             exchange_status = "🔴"
             await asyncio.sleep(20)
 
-# --- واجهة الويب المحمية ---
+# --- الواجهة ---
 @app.route('/')
 def index():
+    conn = get_db_connection()
+    if conn is None:
+        return "<h3>⚠️ خطأ: تعذر الاتصال بقاعدة البيانات. تأكد من إعدادات Render.</h3>", 500
+    
     try:
-        conn = get_db_connection()
-        if not conn: return "<h1>خطأ في الاتصال بالقاعدة.. يرجى التحقق من Logs</h1>", 500
-        
-        cur = conn.cursor(extras.DictCursor)
+        cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
         ot = cur.fetchall()
         cur.execute("SELECT * FROM closed_trades ORDER BY id DESC LIMIT 10")
@@ -117,7 +108,7 @@ def index():
             table { width: 100%; border-collapse: collapse; background: #1e2329; margin-top: 10px; }
             th, td { padding: 10px; border: 1px solid #2b3139; font-size: 13px; }
             .up { color: #0ecb81; } .down { color: #f6465d; }
-            .btn { background: #f6465d; color: white; padding: 4px 8px; border-radius: 4px; text-decoration: none; font-size: 11px; }
+            .btn { background: #f6465d; color: white; padding: 5px; border-radius: 4px; text-decoration: none; font-size: 11px; }
         </style></head><body>
             <div class="card">
                 <h2>💰 المحفظة: ${{ "%.2f"|format(balance) }}</h2>
@@ -132,18 +123,11 @@ def index():
                 <td><a href="/manual_close/{{ t.symbol }}" class="btn">إغلاق يدوي</a></td></tr>
                 {% endfor %}
             </table>
-            <h3>📜 السجل</h3>
-            <table>
-                <tr><th>العملة</th><th>النتيجة</th><th>السبب</th></tr>
-                {% for c in ct %}
-                <tr><td>{{ c.symbol }}</td><td class="{{ 'up' if c.pnl >= 0 else 'down' }}">${{ "%.2f"|format(c.pnl) }}</td><td>{{ c.exit_reason }}</td></tr>
-                {% endfor %}
-            </table>
         </body></html>
         """, s_ex=exchange_status, ot=ot, ct=ct, balance=balance)
     except Exception as e:
-        print(f"WEB ERROR: {e}")
-        return f"<h1>حدث خطأ فني: {e}</h1>", 500
+        if conn: conn.close()
+        return f"<h3>⚠️ خطأ في معالجة البيانات: {e}</h3>", 500
 
 @app.route('/manual_close/<symbol>')
 def manual_close_route(symbol):
