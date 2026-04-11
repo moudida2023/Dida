@@ -6,35 +6,34 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- الإعدادات (v640) ---
-INITIAL_CAPITAL = 1000.0
-INVESTMENT_PER_TRADE = 50.0
-MAX_TRADES = 20
-RADAR_THRESHOLD = 70
-TP_PCT, SL_PCT = 1.04, 0.98
+# --- الإعدادات الثابتة ---
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
+INITIAL_CAPITAL = 1000.0
+INVESTMENT = 50.0
 
 def get_db_connection():
-    try: return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=15)
-    except: return None
+    try:
+        return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=15)
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return None
 
 def close_position(symbol, exit_price, reason):
     conn = get_db_connection()
-    if not conn: return False
+    if not conn: return
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades WHERE symbol = %s", (str(symbol),))
         t = cur.fetchone()
         if t:
-            pnl = ((float(exit_price) - float(t['entry_price'])) / float(t['entry_price'])) * INVESTMENT_PER_TRADE
+            pnl = ((float(exit_price) - float(t['entry_price'])) / float(t['entry_price'])) * INVESTMENT
             cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)",
                         (str(symbol), float(t['entry_price']), float(exit_price), pnl, str(reason), datetime.now().strftime('%H:%M:%S')))
             cur.execute("UPDATE wallet SET balance = balance + %s WHERE id = 1", (pnl,))
             cur.execute("DELETE FROM trades WHERE symbol = %s", (str(symbol),))
             conn.commit()
         cur.close(); conn.close()
-        return True
-    except: return False
+    except: pass
 
 async def trading_engine():
     exchange = ccxt.gateio({'enableRateLimit': True})
@@ -51,32 +50,33 @@ async def trading_engine():
                     for t in active:
                         sym = str(t['symbol'])
                         if sym in tickers:
-                            curr_p = float(tickers[sym]['last'])
-                            entry = float(t['entry_price'])
-                            if curr_p >= entry * TP_PCT: close_position(sym, curr_p, "🎯 TP 4%")
-                            elif curr_p <= entry * SL_PCT: close_position(sym, curr_p, "🛑 SL 2%")
-                            else: cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
+                            cp = float(tickers[sym]['last'])
+                            en = float(t['entry_price'])
+                            if cp >= en * 1.04: close_position(sym, cp, "🎯 الربح 4%")
+                            elif cp <= en * 0.98: close_position(sym, cp, "🛑 الخسارة 2%")
+                            else: cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (cp, sym))
                 conn.commit(); cur.close(); conn.close()
-            await asyncio.sleep(15)
-        except: await asyncio.sleep(20)
+            await asyncio.sleep(20)
+        except: await asyncio.sleep(30)
 
 @app.route('/')
 def index():
-    conn = get_db_connection()
-    if not conn: return "DB Error", 500
-    cur = conn.cursor(extras.DictCursor)
-    cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
-    ot = cur.fetchall()
-    cur.execute("SELECT balance FROM wallet WHERE id = 1")
-    res_w = cur.fetchone()
-    realized_pnl = float(res_w[0]) if res_w else 0.0
-    cur.close(); conn.close()
-    
-    floating = sum(((float(t['current_price'])-float(t['entry_price']))/float(t['entry_price']))*50 for t in ot)
-    net = INITIAL_CAPITAL + realized_pnl + floating
-
-    return render_template_string("""
-<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
+    try:
+        conn = get_db_connection()
+        if not conn: return "Database Connection Error", 500
+        cur = conn.cursor(extras.DictCursor)
+        cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
+        ot = cur.fetchall()
+        cur.execute("SELECT balance FROM wallet WHERE id = 1")
+        res = cur.fetchone()
+        r_pnl = float(res[0]) if res else 0.0
+        cur.close(); conn.close()
+        
+        f_pnl = sum(((float(t['current_price'])-float(t['entry_price']))/float(t['entry_price']))*INVESTMENT for t in ot)
+        net = INITIAL_CAPITAL + r_pnl + f_pnl
+        
+        return render_template_string("""
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
 <style>
     body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; margin: 0; padding: 10px; }
     .card { background: #1e2329; padding: 15px; border-radius: 10px; border-bottom: 3px solid #f0b90b; margin-bottom: 10px; }
@@ -85,21 +85,22 @@ def index():
     th, td { padding: 8px; border: 1px solid #2b3139; }
 </style></head><body>
     <div class="card">
-        <small>صافي المحفظة</small><br><b style="font-size:24px;">${{ "%.2f"|format(n) }}</b><br>
-        <small>الصفقات: {{ c }} / 20</small>
+        <small>إجمالي قيمة المحفظة</small><br><b style="font-size:24px;">${{ "%.2f"|format(net) }}</b><br>
+        <small>الصفقات المفتوحة: {{ count }} / 20</small>
     </div>
-    <div style="display:flex; justify-content:space-around; font-size:12px;">
-        <div>السيولة: ${{ "%.2f"|format(1000 + r - (c*50)) }}</div>
-        <div class="{{ 'up' if f >= 0 else 'down' }}">الأرباح: ${{ "%.2f"|format(f) }}</div>
+    <div style="display:flex; justify-content:space-around; font-size:12px; margin-bottom:10px;">
+        <div>السيولة: ${{ "%.2f"|format(1000 + r - (count*50)) }}</div>
+        <div class="{{ 'up' if f >= 0 else 'down' }}">أرباح عائمة: ${{ "%.2f"|format(f) }}</div>
     </div>
     <table>
-        <tr><th>العملة</th><th>السعر</th><th>الربح $</th></tr>
+        <tr><th>العملة</th><th>السعر</th><th>الربح ($)</th></tr>
         {% for t in ot %}
         {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 50 %}
-        <tr><td>{{ t.symbol }}</td><td style="color:#f0b90b;">{{ t.current_price }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
+        <tr><td><b>{{ t.symbol }}</b></td><td style="color:#f0b90b;">{{ "%.5f"|format(t.current_price) }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
         {% endfor %}
     </table>
-</body></html>""", n=net, c=len(ot), r=realized_pnl, f=floating, ot=ot)
+</body></html>""", net=net, count=len(ot), r=r_pnl, f=f_pnl, ot=ot)
+    except Exception as e: return str(e), 500
 
 def keep_alive():
     while True:
