@@ -36,6 +36,7 @@ def execute_close_logic(symbol, exit_price, reason="Auto"):
             inv = float(trade['investment'] or 0)
             ent = float(trade['entry_price'] or 1)
             pnl = ((float(exit_price) - ent) / ent) * inv
+            # تخزين الوقت بنص ثابت لتجنب مشاكل التنسيق لاحقاً
             cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s, %s, %s, %s, %s, %s)", 
                         (symbol, ent, float(exit_price), pnl, reason, datetime.now()))
             cur.execute("UPDATE wallet SET balance = balance + %s WHERE id = 1", (pnl,))
@@ -70,17 +71,13 @@ def index():
             cur = conn.cursor(cursor_factory=extras.DictCursor)
             cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
             active_trades = cur.fetchall()
-            
             cur.execute("SELECT * FROM closed_trades ORDER BY close_time DESC LIMIT 10")
             closed_history = cur.fetchall()
-            
             cur.execute("SELECT pnl FROM closed_trades WHERE close_time > %s", (datetime.now() - timedelta(hours=24),))
             realized_24h = sum(float(c[0]) for c in cur.fetchall())
-            
             cur.execute("SELECT balance FROM wallet WHERE id = 1")
             row = cur.fetchone()
             balance = float(row[0]) if row else 0.0
-            
             floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in active_trades)
             cur.close(); conn.close()
         except:
@@ -98,7 +95,7 @@ def index():
         th { color: #848e9c; font-size: 12px; padding: 10px; }
         td { padding: 15px 5px; border-bottom: 1px solid #2b3139; }
         .up { color: #0ecb81; font-weight: bold; } .down { color: #f6465d; font-weight: bold; }
-        .btn-x { background: #f6465d; color: white; border: none; padding: 10px 15px; border-radius: 5px; font-weight: bold; cursor: pointer; }
+        .btn-x { background: #f6465d; color: white; border: none; padding: 10px 15px; border-radius: 5px; font-weight: bold; }
     </style></head><body>
         <div class="status">
             <span>Server: {{ st.server }}</span> <span>DB: {{ st.db }}</span> <span>Gate: {{ st.exchange }}</span>
@@ -129,7 +126,12 @@ def index():
             <tr>
                 <td style="text-align:right;">{{ h.symbol.split('/')[0] }}</td>
                 <td class="{{ 'up' if h.pnl >= 0 else 'down' }}">${{ "%.2f"|format(h.pnl) }}</td>
-                <td>{% if h.close_time %}{{ h.close_time.strftime('%H:%M') }}{% endif %}</td>
+                <td>
+                    {# حل مشكلة strftime: عرض الوقت كما هو إذا كان نصاً #}
+                    {% if h.close_time is string %} {{ h.close_time[:5] }} 
+                    {% elif h.close_time %} {{ h.close_time.strftime('%H:%M') }} 
+                    {% endif %}
+                </td>
                 <td>{{ h.exit_reason }}</td>
             </tr>
             {% endfor %}
@@ -147,8 +149,7 @@ async def monitor_engine():
             if conn:
                 cur = conn.cursor(cursor_factory=extras.DictCursor)
                 cur.execute("SELECT * FROM trades")
-                rows = cur.fetchall()
-                for t in rows:
+                for t in cur.fetchall():
                     sym = t['symbol']
                     if sym in tickers:
                         curr_p = float(tickers[sym]['last'])
