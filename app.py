@@ -36,41 +36,39 @@ def get_db_connection():
         return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=10)
     except: return None
 
-# --- FONCTION DE CALCUL DES STATISTIQUES 24H ---
 def get_24h_stats():
     conn = get_db_connection()
-    if not conn: return "Erreur de connexion BD pour les stats."
-    
+    if not conn: return "⚠️ Erreur de connexion BD."
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         last_24h = datetime.now() - timedelta(hours=24)
-        
         cur.execute("SELECT * FROM closed_trades WHERE close_time >= %s", (last_24h,))
         trades = cur.fetchall()
-        
-        if not trades:
-            return "📊 *Stats (24h):* Aucun ordre fermé."
-        
+        if not trades: return "📊 *Stats (24h):* Aucun ordre fermé."
         total = len(trades)
         wins = len([t for t in trades if "TP" in t['exit_reason']])
         net_pnl = sum([float(t['pnl']) for t in trades])
         win_rate = (wins / total) * 100
-        
-        msg = (
-            f"📊 *Performance (Dernières 24h)*\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"✅ Ordres Gagnants: {wins}\n"
-            f"❌ Ordres Perdants: {total - wins}\n"
-            f"📈 Win Rate: *{win_rate:.1f}%*\n"
-            f"💵 Profit Net: *${net_pnl:+.2f}*\n"
-            f"📦 Total Traité: {total}"
-        )
+        msg = (f"📊 *Performance (24h)*\n━━━━━━━━━━━━━━━\n✅ Wins: {wins} | ❌ Loss: {total-wins}\n"
+               f"📈 Win Rate: *{win_rate:.1f}%*\n💵 Profit Net: *${net_pnl:+.2f}*")
         cur.close(); conn.close()
         return msg
-    except Exception as e:
-        return f"⚠️ Erreur stats: {e}"
+    except: return "⚠️ Erreur calcul stats."
 
-# --- MOTEUR DE TRADING ---
+def calculate_score(ticker):
+    score = 0
+    try:
+        change = float(ticker.get('percentage', 0) or 0)
+        vol = float(ticker.get('quoteVolume', 0) or 0)
+        last = float(ticker.get('last', 0) or 0)
+        high = float(ticker.get('high', 0) or 1)
+        if 2.0 <= change <= 8.0: score += 40
+        if vol > 50000: score += 30
+        if last >= high * 0.98: score += 30
+    except: pass
+    return score
+
+# --- MOTEUR DE TRADING ET RADAR ---
 async def monitor_engine():
     exchange = ccxt.gateio({'enableRateLimit': True})
     while True:
@@ -86,6 +84,7 @@ async def monitor_engine():
                 active_trades = cur.fetchall()
                 active_list = [t['symbol'] for t in active_trades]
                 
+                # 1. إدارة الصفقات المفتوحة
                 for t in active_trades:
                     sym = t['symbol']
                     if sym in all_tickers:
@@ -96,32 +95,49 @@ async def monitor_engine():
                         if pnl >= TP_VAL or pnl <= SL_VAL:
                             reason = "✅ TP (+3%)" if pnl >= TP_VAL else "❌ SL (-3%)"
                             p_val = (pnl/100)*TRADE_INVESTMENT
-                            
-                            # Insertion de l'ordre fermé
                             cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)", 
                                         (sym, float(t['entry_price']), curr_p, p_val, reason, datetime.now()))
                             cur.execute("DELETE FROM trades WHERE symbol = %s", (sym,))
-                            conn.commit() # Commit avant les stats
-                            
-                            # Alerte de fermeture
-                            send_telegram_msg(f"💰 *Fermeture:* {sym}\n📊 PnL: {pnl:.2f}% ({reason})")
-                            
-                            # --- AJOUT: Rapport 24h après chaque fermeture ---
-                            stats_report = get_24h_stats()
-                            send_telegram_msg(stats_report)
+                            conn.commit()
+                            send_telegram_msg(f"💰 *Fermeture:* {sym} ({reason})\n📊 PnL: {pnl:.2f}%")
+                            send_telegram_msg(get_24h_stats())
 
-                # Logic d'ouverture (inchangé)
+                # 2. رصد كل العملات (Score 100) وإرسال القائمة
+                score_100_list = []
                 for i in range(0, len(valid_symbols), 100):
-                    for sym in valid_symbols[i:i+100]:
-                        # calculate_score... (votre logique habituelle)
-                        pass 
+                    chunk = valid_symbols[i:i+100]
+                    for sym in chunk:
+                        if calculate_score(all_tickers[sym]) == 100:
+                            score_100_list.append(sym)
+                            
+                            # فتح صفقة إذا توفر مكان
+                            if len(active_list) < MAX_VIRTUAL_TRADES and sym not in active_list:
+                                price = float(all_tickers[sym]['last'])
+                                cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time) VALUES (%s,%s,%s,%s,%s)",
+                                            (sym, price, price, TRADE_INVESTMENT, datetime.now()))
+                                active_list.append(sym)
+                                send_telegram_msg(f"🚀 *Nouvel Ordre:* {sym}\n💵 Prix: {price:.6f}\n🎯 TP: {price*1.03:.6f} | 🛑 SL: {price*0.97:.6f}")
+
+                # إرسال قائمة العملات المكتشفة
+                if score_100_list:
+                    list_msg = "📍 *Cryptos avec Score 100 détectées :*\n" + "\n".join([f"• `{s}`" for s in score_100_list])
+                    send_telegram_msg(list_msg)
 
                 conn.commit()
                 cur.close(); conn.close()
-            await asyncio.sleep(20)
+            await asyncio.sleep(30) # فحص كل 30 ثانية لتجنب الرسائل المزعجة
         except: await asyncio.sleep(30)
 
-# --- (Self-Ping et Flask inchangés) ---
+# --- (Self-Ping et Flask - نفس النسخ السابقة) ---
+def self_ping():
+    if not RENDER_APP_URL: return
+    while True:
+        try:
+            time.sleep(840)
+            requests.get(RENDER_APP_URL, timeout=10)
+        except: pass
+
 if __name__ == "__main__":
-    # threading.Thread... (v590)
+    threading.Thread(target=self_ping, daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
