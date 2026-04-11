@@ -102,7 +102,7 @@ def close_position(symbol, exit_price, reason):
 @app.route('/')
 def index():
     conn = get_db_connection()
-    if not conn: return "DB Error", 500
+    if not conn: return "DB Connection Error", 500
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
@@ -118,7 +118,7 @@ def index():
         net_val = INITIAL_CAPITAL + realized_pnl + floating
 
         return render_template_string("""
-        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
+        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
         <style>
             body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; margin: 0; }
             .card { background: #1e2329; padding: 20px; border-radius: 12px; border: 1px solid #f0b90b; margin-bottom: 20px; }
@@ -146,7 +146,7 @@ def index():
                 </tr>
                 {% endfor %}
             </table>
-            <h4 class="section-title">✅ آخر الصفقات المغلقة</h4>
+            <h4 class="section-title">✅ تاريخ الإغلاق</h4>
             <table>
                 <tr><th>العملة</th><th>الربح ($)</th><th>السبب</th></tr>
                 {% for c in closed %}
@@ -176,6 +176,7 @@ async def trading_engine():
                         curr_p = float(tickers[sym]['last'])
                         entry_p = float(t['entry_price'])
                         curr_pnl_pct = (curr_p - entry_p) / entry_p * 100
+                        
                         m_asc = max(float(t['max_asc'] or 0), curr_pnl_pct)
                         m_desc = min(float(t['max_desc'] or 0), curr_pnl_pct)
                         
@@ -185,4 +186,26 @@ async def trading_engine():
                         if curr_pnl_pct >= (TAKE_PROFIT_PCT * 100): 
                             close_position(sym, curr_p, "🎯 TP 4%")
                         elif curr_pnl_pct <= -(STOP_LOSS_PCT * 100): 
-                            close_position(sym
+                            close_position(sym, curr_p, "🛑 SL 2%")
+                
+                if len(active_trades) < MAX_TRADES:
+                    for sym, data in tickers.items():
+                        if '/USDT' in sym and sym not in [x['symbol'] for x in active_trades]:
+                            score = calculate_trade_score(data)
+                            if score >= ENTRY_SCORE_THRESHOLD:
+                                p = float(data['last'])
+                                cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, investment, open_time, max_asc, max_desc, entry_score) 
+                                               VALUES (%s, %s, %s, %s, %s, 0, 0, %s)""",
+                                           (sym, p, p, INVESTMENT_PER_TRADE, datetime.now().strftime('%H:%M'), score))
+                                break
+                conn.commit(); cur.close(); conn.close()
+            await asyncio.sleep(20)
+        except: 
+            await asyncio.sleep(20)
+
+if __name__ == "__main__":
+    init_db_updates()
+    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(trading_engine()), daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
