@@ -132,7 +132,6 @@ def index():
                 <small>صافي قيمة المحفظة</small><br>
                 <b style="font-size:30px;">${{ "%.2f"|format(net) }}</b>
             </div>
-            
             <h4 class="section-title">📍 صفقات نشطة</h4>
             <table>
                 <tr><th>العملة</th><th>سكور</th><th>أعلى صعود</th><th>أدنى نزول</th><th>الربح %</th></tr>
@@ -147,9 +146,43 @@ def index():
                 </tr>
                 {% endfor %}
             </table>
-
             <h4 class="section-title">✅ آخر الصفقات المغلقة</h4>
             <table>
                 <tr><th>العملة</th><th>الربح ($)</th><th>السبب</th></tr>
                 {% for c in closed %}
-                <tr><td>{{ c.symbol }}</td><td class="{{ 'up
+                <tr><td>{{ c.symbol }}</td><td class="{{ 'up' if c.pnl >= 0 else 'down' }}">${{ "%.2f"|format(c.pnl) }}</td><td>{{ c.exit_reason }}</td></tr>
+                {% endfor %}
+            </table>
+        </body></html>
+        """, net=net_val, active=active_trades, closed=closed_trades)
+    except: 
+        return "Dashboard Error", 500
+
+# --- 4. محرك التداول ---
+async def trading_engine():
+    exchange = ccxt.gateio({'enableRateLimit': True})
+    while True:
+        try:
+            tickers = await exchange.fetch_tickers()
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor(cursor_factory=extras.DictCursor)
+                cur.execute("SELECT * FROM trades")
+                active_trades = cur.fetchall()
+                
+                for t in active_trades:
+                    sym = t['symbol']
+                    if sym in tickers:
+                        curr_p = float(tickers[sym]['last'])
+                        entry_p = float(t['entry_price'])
+                        curr_pnl_pct = (curr_p - entry_p) / entry_p * 100
+                        m_asc = max(float(t['max_asc'] or 0), curr_pnl_pct)
+                        m_desc = min(float(t['max_desc'] or 0), curr_pnl_pct)
+                        
+                        cur.execute("UPDATE trades SET current_price = %s, max_asc = %s, max_desc = %s WHERE symbol = %s", 
+                                   (curr_p, m_asc, m_desc, sym))
+                        
+                        if curr_pnl_pct >= (TAKE_PROFIT_PCT * 100): 
+                            close_position(sym, curr_p, "🎯 TP 4%")
+                        elif curr_pnl_pct <= -(STOP_LOSS_PCT * 100): 
+                            close_position(sym
