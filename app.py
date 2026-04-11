@@ -1,19 +1,19 @@
 import os
 import threading
 import time
-import requests
 import asyncio
 import ccxt.pro as ccxt
 import psycopg2
 from psycopg2 import extras
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, redirect, url_for
 from datetime import datetime
+import requests
 
 app = Flask(__name__)
 
-# --- 1. الإعدادات ---
+# --- 1. الإعدادات وتأمين الروابط ---
 DB_URL = os.environ.get('DATABASE_URL')
-APP_URL = os.environ.get('APP_URL')
+APP_URL = os.environ.get('APP_URL') # رابط موقعك لمنع النوم
 
 def get_db_connection():
     try:
@@ -21,17 +21,16 @@ def get_db_connection():
         return psycopg2.connect(url, sslmode='require', connect_timeout=10)
     except: return None
 
-# --- 2. محرك التداول (البحث عن الصفقات وحفظها) ---
+# --- 2. محرك التداول المطور (سكور 80+) ---
 async def trading_engine():
-    """هذا هو المحرك الذي يملأ قاعدة البيانات بالبيانات لتظهر في الموقع"""
-    print("🚀 بدء محرك البحث عن الصفقات...")
-    
-    # إنشاء الجدول إذا لم يكن موجوداً
+    # تهيئة الجداول
     conn = get_db_connection()
     if conn:
         cur = conn.cursor()
         cur.execute('''CREATE TABLE IF NOT EXISTS trades 
-            (symbol TEXT PRIMARY KEY, entry_price REAL, current_price REAL, open_time TEXT)''')
+            (symbol TEXT PRIMARY KEY, entry_price REAL, current_price REAL, investment REAL, score INTEGER, open_time TEXT)''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS closed_trades 
+            (id SERIAL PRIMARY KEY, symbol TEXT, pnl REAL, close_time TEXT)''')
         conn.commit()
         cur.close(); conn.close()
 
@@ -39,93 +38,96 @@ async def trading_engine():
     
     while True:
         try:
-            # جلب أسعار السوق
             tickers = await exchange.fetch_tickers()
-            # اختيار أفضل 10 عملات من حيث حجم التداول (USDT)
-            top_symbols = sorted([s for s in tickers if '/USDT' in s], 
-                               key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:10]
+            symbols = [s for s in tickers if '/USDT' in s]
             
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor()
-                for sym in top_symbols:
+                # تحديث أسعار الصفقات المفتوحة حالياً من الداتابيز
+                cur.execute("SELECT symbol FROM trades")
+                active_on_db = [r[0] for r in cur.fetchall()]
+                
+                for sym in symbols[:60]: # مسح عينة من السوق
                     price = tickers[sym]['last']
-                    # إدخال أو تحديث السعر الحالي
-                    cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, open_time) 
-                                   VALUES (%s, %s, %s, %s) 
-                                   ON CONFLICT (symbol) DO UPDATE SET current_price = EXCLUDED.current_price""", 
-                                (sym, price, price, datetime.now().strftime('%H:%M:%S')))
+                    change = tickers[sym].get('percentage', 0)
+                    
+                    # منطق السكور: إذا كانت الحركة قوية نعطيه سكور 80+
+                    current_score = 85 if change > 1.5 else 40
+                    
+                    if sym in active_on_db:
+                        # تحديث السعر الحالي فقط إذا كانت الصفقة مفتوحة
+                        cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (price, sym))
+                    elif current_score >= 80:
+                        # دخول صفقة جديدة بسكور 80
+                        cur.execute("""INSERT INTO trades (symbol, entry_price, current_price, investment, score, open_time) 
+                                       VALUES (%s, %s, %s, 50.0, %s, %s) 
+                                       ON CONFLICT (symbol) DO NOTHING""", 
+                                    (sym, price, price, current_score, datetime.now().strftime('%H:%M:%S')))
+                
                 conn.commit()
                 cur.close(); conn.close()
-            
-            await asyncio.sleep(30) # تحديث كل 30 ثانية
+            await asyncio.sleep(20)
         except Exception as e:
-            print(f"⚠️ خطأ المحرك: {e}")
+            print(f"Engine Error: {e}")
             await asyncio.sleep(20)
 
-# --- 3. برنامج النبض الذاتي (Keep-Alive) ---
-def self_ping():
-    time.sleep(60)
+# --- 3. نظام النبض الذاتي (Keep-Alive) ---
+def keep_alive():
+    time.sleep(30)
     while True:
         if APP_URL:
-            try: requests.get(APP_URL, timeout=20)
+            try:
+                requests.get(APP_URL, timeout=20)
+                print(f"📡 نبضة استمرارية ناجحة: {datetime.now().strftime('%H:%M:%S')}")
             except: pass
-        time.sleep(240)
+        time.sleep(240) # كل 4 دقائق
 
-# --- 4. واجهة العرض (Dashboard) ---
+# --- 4. التحكم في الصفقات (إغلاق يدوي) ---
+@app.route('/close/<symbol>')
+def close_trade(symbol):
+    conn = get_db_connection()
+    if conn:
+        cur = conn.cursor(cursor_factory=extras.DictCursor)
+        cur.execute("SELECT * FROM trades WHERE symbol = %s", (symbol,))
+        trade = cur.fetchone()
+        if trade:
+            pnl = ((trade['current_price'] - trade['entry_price']) / trade['entry_price']) * trade['investment']
+            cur.execute("INSERT INTO closed_trades (symbol, pnl, close_time) VALUES (%s, %s, %s)",
+                        (trade['symbol'], pnl, datetime.now().strftime('%Y-%m-%d %H:%M')))
+            cur.execute("DELETE FROM trades WHERE symbol = %s", (symbol,))
+        conn.commit()
+        cur.close(); conn.close()
+    return redirect(url_for('index'))
+
+# --- 5. واجهة العرض Dashboard v170 ---
 @app.route('/')
 def index():
-    trades = []
+    open_trades = []
+    closed_pnl = 0
+    floating_pnl = 0
     try:
         conn = get_db_connection()
-        if conn:
-            cur = conn.cursor(cursor_factory=extras.DictCursor)
-            cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
-            trades = cur.fetchall()
-            cur.close(); conn.close()
+        cur = conn.cursor(cursor_factory=extras.DictCursor)
+        cur.execute("SELECT * FROM trades")
+        open_trades = cur.fetchall()
+        for t in open_trades:
+            floating_pnl += ((t['current_price'] - t['entry_price']) / t['entry_price']) * t['investment']
+        
+        cur.execute("SELECT SUM(pnl) FROM closed_trades")
+        closed_pnl = cur.fetchone()[0] or 0
+        cur.close(); conn.close()
     except: pass
+
+    total_net = closed_pnl + floating_pnl
 
     return render_template_string("""
     <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
+    <title>Trading System v170</title>
     <style>
-        body { background: #0b0e11; color: white; font-family: sans-serif; padding: 20px; text-align: center; }
-        .card { background: #1e2329; border: 1px solid #f0b90b; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-        table { width: 100%; border-collapse: collapse; background: #1e2329; }
-        th, td { padding: 12px; border-bottom: 1px solid #2b3139; text-align: center; }
-        .price { color: #f0b90b; font-weight: bold; }
-    </style></head><body>
-        <div class="card">
-            <h1>📊 مراقب الصفقات المباشر</h1>
-            <p>عدد الصفقات المسجلة في القاعدة: <b>{{ trades|length }}</b></p>
-        </div>
-        <table>
-            <tr><th>العملة</th><th>سعر الدخول</th><th>السعر الحالي</th><th>وقت التحديث</th></tr>
-            {% for t in trades %}
-            <tr>
-                <td><b>{{ t.symbol }}</b></td>
-                <td>{{ t.entry_price }}</td>
-                <td class="price">{{ t.current_price }}</td>
-                <td style="color:#848e9c;">{{ t.open_time }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% if not trades %}<p>⚠️ جاري البحث عن صفقات... انتظر 30 ثانية.</p>{% endif %}
-    </body></html>
-    """, trades=trades)
-
-# --- 5. تشغيل كل شيء معاً ---
-if __name__ == "__main__":
-    # تشغيل النبض الذاتي
-    threading.Thread(target=self_ping, daemon=True).start()
-    
-    # تشغيل محرك البحث عن الصفقات (عبر Asyncio في خيط منفصل)
-    def start_engine():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(trading_engine())
-
-    threading.Thread(target=start_engine, daemon=True).start()
-    
-    # تشغيل Flask
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        body { background: #0b0e11; color: white; font-family: 'Segoe UI', Tahoma, sans-serif; padding: 20px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .card { background: #1e2329; padding: 20px; border-radius: 12px; text-align: center; border-bottom: 4px solid #f0b90b; }
+        .up { color: #0ecb81; } .down { color: #f6465d; }
+        table { width: 100%; border-collapse: collapse; background: #1e2329; border-radius: 10px; overflow: hidden; }
+        th, td { padding: 15px; border-bottom: 1px solid #2b3139; text
