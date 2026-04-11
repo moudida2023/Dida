@@ -9,12 +9,12 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# --- الإعدادات الثابتة ---
+# --- الإعدادات الفنية والقواعد ---
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
 TAKE_PROFIT = 5.0
 STOP_LOSS = -5.0
-TRADE_AMOUNT = 50.0  
-MAX_TRADES = 20      
+TRADE_AMOUNT = 50.0  # حجم دخول الصفقة
+MAX_TRADES = 20      # الحد الأقصى للصفقات المفتوحة
 status_indicators = {"db": "🔴", "exchange": "🔴", "server": "🟢"}
 
 def get_db_connection():
@@ -26,7 +26,7 @@ def get_db_connection():
         status_indicators["db"] = "🔴"
         return None
 
-# --- وظيفة إغلاق صفقة واحدة ---
+# --- وظائف التداول ---
 def execute_close_logic(symbol, exit_price, reason="Auto"):
     conn = get_db_connection()
     if not conn: return
@@ -47,7 +47,22 @@ def execute_close_logic(symbol, exit_price, reason="Auto"):
     except:
         if conn: conn.close()
 
-# --- مسار إغلاق كل الصفقات ---
+def calculate_score(ticker):
+    """منطق السكور 100 لفلترة العملات"""
+    score = 0
+    try:
+        change = float(ticker['percentage'] or 0)
+        volume = float(ticker['quoteVolume'] or 0)
+        # 1. صعود قوي ولكن عقلاني
+        if 2.0 <= change <= 8.0: score += 40
+        # 2. سيولة ممتازة
+        if volume > 50000: score += 30
+        # 3. زخم شرائي (قريب من القمة اليومية)
+        if float(ticker['last']) >= float(ticker['high']) * 0.98: score += 30
+    except: pass
+    return score
+
+# --- مسارات Flask ---
 @app.route('/close_all', methods=['POST'])
 def close_all_trades():
     conn = get_db_connection()
@@ -92,8 +107,7 @@ def index():
             cur.execute("SELECT pnl FROM closed_trades WHERE close_time > %s", (datetime.now() - timedelta(hours=24),))
             realized_24h = sum(float(c[0]) for c in cur.fetchall())
             cur.execute("SELECT balance FROM wallet WHERE id = 1")
-            row = cur.fetchone()
-            balance = float(row[0]) if row else 0.0
+            row = cur.fetchone(); balance = float(row[0]) if row else 0.0
             floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment'] or TRADE_AMOUNT) for t in active_trades)
             cur.close(); conn.close()
         except:
@@ -117,11 +131,9 @@ def index():
         <div class="status">
             <span>Server: {{ st.server }}</span> <span>DB: {{ st.db }}</span> <span>Gate: {{ st.exchange }}</span>
         </div>
-        
-        <form action="/close_all" method="post" onsubmit="return confirm('هل أنت متأكد من إغلاق جميع الصفقات فوراً؟');">
-            <button type="submit" class="btn-panic">🔥 إغلاق جميع الصفقات (PANIC CLOSE)</button>
+        <form action="/close_all" method="post" onsubmit="return confirm('إغلاق كل الصفقات؟');">
+            <button type="submit" class="btn-panic">🔥 PANIC CLOSE ALL</button>
         </form>
-
         <div class="card">
             <div style="font-size: 14px; color: #848e9c;">رأس المال الكلي الحالي</div>
             <div class="main-val">${{ "%.2f"|format(balance + 1000 + floating) }}</div>
@@ -130,8 +142,7 @@ def index():
                 <div class="stat-box"><small>عائم الآن</small><br><span class="{{ 'up' if floating >= 0 else 'down' }}">${{ "%.2f"|format(floating) }}</span></div>
             </div>
         </div>
-
-        <h3 style="text-align:right; margin-right:15px; color:#f0b90b;">📍 صفقات مفتوحة ({{ active|length }}/20)</h3>
+        <h3 style="text-align:right; margin-right:15px; color:#f0b90b;">📍 صفقات حية ({{ active|length }}/20)</h3>
         <table>
             <tr><th>العملة</th><th>الربح</th><th>Max/Min</th><th></th></tr>
             {% for t in active %}
@@ -147,4 +158,50 @@ def index():
     </body></html>
     """, st=status_indicators, balance=balance, floating=floating, realized=realized_24h, active=active_trades)
 
-# (أكمل محرك monitor_engine كما في v572)
+# --- المحرك الرئيسي (Monitor & Discovery) ---
+async def monitor_engine():
+    exchange = ccxt.gateio({'enableRateLimit': True})
+    while True:
+        try:
+            tickers = await exchange.fetch_tickers()
+            status_indicators["exchange"] = "🟢"
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor(extras.DictCursor)
+                
+                # 1. تحديث وإغلاق الصفقات الحالية
+                cur.execute("SELECT * FROM trades")
+                active = cur.fetchall()
+                for t in active:
+                    s = t['symbol']
+                    if s in tickers:
+                        curr_p = float(tickers[s]['last'])
+                        pnl = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
+                        m_a = max(float(t['max_asc'] or 0), pnl)
+                        m_d = min(float(t['max_desc'] or 0), pnl)
+                        cur.execute("UPDATE trades SET current_price=%s, max_asc=%s, max_desc=%s WHERE symbol=%s", (curr_p, m_a, m_d, s))
+                        if pnl >= TAKE_PROFIT: execute_close_logic(s, curr_p, "TP +5%")
+                        elif pnl <= STOP_LOSS: execute_close_logic(s, curr_p, "SL -5%")
+
+                # 2. البحث عن فرص جديدة (Score 100)
+                if len(active) < MAX_TRADES:
+                    for symbol, ticker in tickers.items():
+                        if '/USDT' in symbol and 'BEAR' not in symbol and 'BULL' not in symbol:
+                            if calculate_score(ticker) == 100:
+                                # التأكد من أننا لم نفتحها بالفعل
+                                cur.execute("SELECT 1 FROM trades WHERE symbol = %s", (symbol,))
+                                if not cur.fetchone():
+                                    cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time, max_asc, max_desc) VALUES (%s,%s,%s,%s,%s,0,0)",
+                                                (symbol, float(ticker['last']), float(ticker['last']), TRADE_AMOUNT, datetime.now()))
+                                    print(f"🚀 صيد جديد: {symbol}")
+                
+                conn.commit(); cur.close(); conn.close()
+            await asyncio.sleep(8)
+        except Exception as e:
+            print(f"Error: {e}")
+            status_indicators["exchange"] = "🔴"
+            await asyncio.sleep(10)
+
+if __name__ == "__main__":
+    threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
