@@ -9,50 +9,71 @@ from datetime import datetime
 import requests
 import time
 
-# 1. تعريف الكائن app أولاً (هذا يحل خطأ NameError)
 app = Flask(__name__)
 
 # --- الإعدادات ---
 INITIAL_CAPITAL = 1000.0
 INVESTMENT_PER_TRADE = 50.0
-ENTRY_SCORE_THRESHOLD = 85
-TAKE_PROFIT_PCT = 0.02
-STOP_LOSS_PCT = 0.012
+ENTRY_SCORE_THRESHOLD = 70   
+TAKE_PROFIT_PCT = 0.04       
+STOP_LOSS_PCT = 0.02         
 MAX_TRADES = 5
 
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
 RENDER_APP_URL = "https://dida-fvym.onrender.com"
 
-# --- الدوال المساعدة ---
+# --- 1. تحديث تلقائي لقاعدة البيانات ---
+def init_db_updates():
+    try:
+        conn = psycopg2.connect(str(DB_URL).strip(), sslmode='require')
+        cur = conn.cursor()
+        cur.execute("""
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='entry_score') THEN
+                    ALTER TABLE trades ADD COLUMN entry_score INT DEFAULT 0;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='max_asc') THEN
+                    ALTER TABLE trades ADD COLUMN max_asc FLOAT DEFAULT 0;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name='max_desc') THEN
+                    ALTER TABLE trades ADD COLUMN max_desc FLOAT DEFAULT 0;
+                END IF;
+            END $$;
+        """)
+        conn.commit()
+        cur.close(); conn.close()
+        print("✅ Database columns checked/added.")
+    except Exception as e:
+        print(f"⚠️ Auto-update DB failed: {e}")
+
 def get_db_connection():
     try:
-        url = str(DB_URL).strip()
-        return psycopg2.connect(url, sslmode='require', connect_timeout=15)
+        return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=15)
     except Exception as e:
-        print(f"❌ DB Connection Error: {e}")
+        print(f"❌ DB Conn Error: {e}")
         return None
 
 def keep_alive():
     while True:
-        try:
-            requests.get(RENDER_APP_URL, timeout=10)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔔 Self-Ping Sent")
+        try: requests.get(RENDER_APP_URL, timeout=10)
         except: pass
         time.sleep(600)
 
+# --- 2. منطق الحسابات الفنية ---
 def calculate_trade_score(ticker):
     score = 0
     try:
         change = float(ticker.get('percentage', 0) or 0)
-        if change > 2.5: score += 30
-        elif change > 1.0: score += 15
+        if change > 1.5: score += 40
+        elif change > 0.5: score += 20
         
         quote_vol = float(ticker.get('quoteVolume', 0) or 0)
-        if quote_vol > 1000000: score += 30
+        if quote_vol > 300000: score += 30
         
         last = float(ticker.get('last', 0) or 0)
         high = float(ticker.get('high', 0) or 0)
-        if last >= (high * 0.985): score += 40
+        if last >= (high * 0.95): score += 30
     except: pass
     return score
 
@@ -77,7 +98,7 @@ def close_position(symbol, exit_price, reason):
         if conn: conn.close()
         return False
 
-# --- المسارات (Routes) ---
+# --- 3. واجهة المستخدم (Dashboard) ---
 @app.route('/')
 def index():
     conn = get_db_connection()
@@ -93,85 +114,42 @@ def index():
         realized_pnl = float(res_w[0]) if res_w else 0.0
         cur.close(); conn.close()
 
-        invested = len(active_trades) * INVESTMENT_PER_TRADE
-        unused = (INITIAL_CAPITAL + realized_pnl) - invested
         floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in active_trades)
-        net_value = INITIAL_CAPITAL + realized_pnl + floating
+        net_val = INITIAL_CAPITAL + realized_pnl + floating
 
         return render_template_string("""
-        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
         <style>
             body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; margin: 0; }
-            .card { background: #1e2329; padding: 15px; border-radius: 10px; border: 1px solid #f0b90b; margin-bottom: 15px; }
-            .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
-            .s-box { background: #1e2329; padding: 10px; border-radius: 8px; border: 1px solid #2b3139; }
+            .card { background: #1e2329; padding: 20px; border-radius: 12px; border: 1px solid #f0b90b; margin-bottom: 20px; }
             .up { color: #0ecb81; } .down { color: #f6465d; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 20px; }
-            th, td { padding: 8px; border: 1px solid #2b3139; }
-            .section-title { color: #f0b90b; margin-top: 20px; text-align: right; }
+            .score-badge { background: #f0b90b; color: black; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
+            th, td { padding: 10px; border: 1px solid #2b3139; }
+            .section-title { color: #f0b90b; text-align: right; margin-top: 20px; border-right: 4px solid #f0b90b; padding-right: 8px; }
         </style></head><body>
             <div class="card">
                 <small>صافي قيمة المحفظة</small><br>
-                <b style="font-size:28px;" class="{{ 'up' if net >= 1000 else 'down' }}">${{ "%.2f"|format(net) }}</b>
+                <b style="font-size:30px;">${{ "%.2f"|format(net) }}</b>
             </div>
-            <div class="stats">
-                <div class="s-box">قيد التداول<br><b style="color:#f0b90b;">${{ "%.2f"|format(inv) }}</b></div>
-                <div class="s-box">رصيد متاح<br><b style="color:#92a2b1;">${{ "%.2f"|format(un) }}</b></div>
-            </div>
-            <h4 class="section-title">📍 صفقات مفتوحة</h4>
+            
+            <h4 class="section-title">📍 صفقات نشطة</h4>
             <table>
-                <tr><th>العملة</th><th>السعر</th><th>الربح</th></tr>
+                <tr><th>العملة</th><th>سكور</th><th>أعلى صعود</th><th>أدنى نزول</th><th>الربح %</th></tr>
                 {% for t in active %}
-                {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 50 %}
-                <tr><td>{{ t.symbol }}</td><td>{{ t.current_price }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
+                {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 100 %}
+                <tr>
+                    <td><b>{{ t.symbol }}</b></td>
+                    <td><span class="score-badge">{{ t.entry_score or '--' }}</span></td>
+                    <td class="up">+{{ "%.2f"|format(t.max_asc or 0) }}%</td>
+                    <td class="down">{{ "%.2f"|format(t.max_desc or 0) }}%</td>
+                    <td class="{{ 'up' if p >= 0 else 'down' }}">{{ "%.2f"|format(p) }}%</td>
+                </tr>
                 {% endfor %}
             </table>
-            <h4 class="section-title">✅ آخر صفقات مغلقة</h4>
+
+            <h4 class="section-title">✅ آخر الصفقات المغلقة</h4>
             <table>
                 <tr><th>العملة</th><th>الربح ($)</th><th>السبب</th></tr>
                 {% for c in closed %}
-                <tr><td>{{ c.symbol }}</td><td class="{{ 'up' if c.pnl >= 0 else 'down' }}">{{ "%.2f"|format(c.pnl) }}</td><td>{{ c.exit_reason }}</td></tr>
-                {% endfor %}
-            </table>
-        </body></html>
-        """, net=net_value, inv=invested, un=unused, active=active_trades, closed=closed_trades)
-    except Exception as e: return f"Error: {e}", 500
-
-# --- المحرك ---
-async def trading_engine():
-    exchange = ccxt.gateio({'enableRateLimit': True})
-    while True:
-        try:
-            tickers = await exchange.fetch_tickers()
-            conn = get_db_connection()
-            if conn:
-                cur = conn.cursor(cursor_factory=extras.DictCursor)
-                cur.execute("SELECT * FROM trades")
-                active_trades = cur.fetchall()
-                for t in active_trades:
-                    sym = t['symbol']
-                    if sym in tickers:
-                        curr_p = float(tickers[sym]['last'])
-                        cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
-                        pnl_pct = (curr_p - float(t['entry_price'])) / float(t['entry_price'])
-                        if pnl_pct >= TAKE_PROFIT_PCT: close_position(sym, curr_p, "🎯 TP")
-                        elif pnl_pct <= -STOP_LOSS_PCT: close_position(sym, curr_p, "🛑 SL")
-                
-                if len(active_trades) < MAX_TRADES:
-                    for sym, data in tickers.items():
-                        if '/USDT' in sym and sym not in [x['symbol'] for x in active_trades]:
-                            score = calculate_trade_score(data)
-                            if score >= ENTRY_SCORE_THRESHOLD:
-                                p = float(data['last'])
-                                cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time) VALUES (%s, %s, %s, %s, %s)",
-                                           (sym, p, p, INVESTMENT_PER_TRADE, datetime.now().strftime('%H:%M')))
-                                break
-                conn.commit(); cur.close(); conn.close()
-            await asyncio.sleep(20)
-        except: await asyncio.sleep(20)
-
-if __name__ == "__main__":
-    threading.Thread(target=keep_alive, daemon=True).start()
-    threading.Thread(target=lambda: asyncio.run(trading_engine()), daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+                <tr><td>{{ c.symbol }}</td><td class="{{ 'up
