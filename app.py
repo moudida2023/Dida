@@ -9,20 +9,27 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- 1. الإعدادات والربط ---
+# --- 1. إعدادات الاتصال الآمنة ---
+# ملاحظة: تم استخدام الرابط الداخلي لضمان استقرار الاتصال بالمنفذ 5432
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a/trading_bot_db_wv1h"
-VIRTUAL_CAPITAL = 1000.0   # قيمة المحفظة لكل صفقة
-TARGET_RATE = 0.03        # هدف الربح 3% (30$)
-STOP_RATE = 0.03          # وقف الخسارة 3% (30$)
-ENTRY_SCORE = 0.5         # شرط الدخول (ارتفاع 0.5% لضمان ملء الجدول)
+
+VIRTUAL_CAPITAL = 1000.0
+TARGET_RATE = 0.03  # 3%
+STOP_RATE = 0.03    # 3%
+ENTRY_SCORE = 0.5   # 0.5% ارتفاع للدخول
 
 def get_db_connection():
     try:
+        # التأكد من استخدام بروتوكول postgresql الصحيح
         url = DB_URL.replace("postgres://", "postgresql://", 1) if DB_URL.startswith("postgres://") else DB_URL
+        # الاتصال عبر المنفذ الافتراضي 5432
         return psycopg2.connect(url, connect_timeout=10)
-    except: return None
+    except Exception as e:
+        print(f"❌ Database Connection Error: {e}")
+        return None
 
 def init_db():
+    """إنشاء الجداول إذا لم تكن موجودة عند بدء التشغيل"""
     conn = get_db_connection()
     if conn:
         cur = conn.cursor()
@@ -34,8 +41,9 @@ def init_db():
              pnl DOUBLE PRECISION, exit_reason TEXT, close_time TEXT)''')
         conn.commit()
         cur.close(); conn.close()
+        print("✅ Database initialized successfully.")
 
-# --- 2. محرك الرصد والتنفيذ ---
+# --- 2. محرك التداول (الرصد والتحليل) ---
 async def trading_engine():
     init_db()
     exchange = ccxt.gateio({'enableRateLimit': True})
@@ -43,34 +51,37 @@ async def trading_engine():
         try:
             conn = get_db_connection()
             if not conn: 
-                await asyncio.sleep(10); continue
+                await asyncio.sleep(15); continue
             
             cur = conn.cursor(cursor_factory=extras.DictCursor)
+            
+            # جلب الصفقات الحالية
             cur.execute("SELECT * FROM trades")
             active_trades = {r['symbol']: r for r in cur.fetchall()}
             
+            # جلب بيانات السوق
             tickers = await exchange.fetch_tickers()
             symbols = sorted([s for s in tickers if '/USDT' in s and tickers[s]['last']], 
                             key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:500]
             
-            # تحديث ومراقبة الأهداف
+            # فحص الإغلاق (3% ربح أو خسارة)
             for sym, data in active_trades.items():
                 if sym not in tickers: continue
-                curr_p = float(tickers[sym]['last'])
+                current_p = float(tickers[sym]['last'])
                 
                 reason = ""
-                if curr_p >= data['tp_price']: reason = "🎯 جني أرباح (+3%)"
-                elif curr_p <= data['sl_price']: reason = "🛑 وقف خسارة (-3%)"
+                if current_p >= data['tp_price']: reason = "🎯 جني أرباح (+3%)"
+                elif current_p <= data['sl_price']: reason = "🛑 وقف خسارة (-3%)"
                 
                 if reason:
-                    pnl = ((curr_p - data['entry_price']) / data['entry_price']) * VIRTUAL_CAPITAL
+                    pnl = ((current_p - data['entry_price']) / data['entry_price']) * VIRTUAL_CAPITAL
                     cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)",
-                                (sym, data['entry_price'], curr_p, pnl, reason, datetime.now().strftime('%m-%d %H:%M')))
+                                (sym, data['entry_price'], current_p, pnl, reason, datetime.now().strftime('%m-%d %H:%M')))
                     cur.execute("DELETE FROM trades WHERE symbol = %s", (sym,))
                 else:
-                    cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
+                    cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (current_p, sym))
             
-            # فتح صفقات جديدة (بحد أقصى 20 صفقة)
+            # البحث عن فرص جديدة
             count = len(active_trades)
             if count < 20:
                 for s in symbols:
@@ -88,50 +99,46 @@ async def trading_engine():
             conn.commit()
             cur.close(); conn.close()
             await asyncio.sleep(20)
-        except: await asyncio.sleep(20)
+        except Exception as e:
+            print(f"Engine Error: {e}")
+            await asyncio.sleep(20)
 
-# --- 3. الواجهة الرسومية (v310) ---
-HTML = """
+# --- 3. واجهة الويب (v320) ---
+HTML_TEMPLATE = """
 <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+<title>Radar v320 Final</title>
 <style>
-    body { background: #0b0e11; color: white; font-family: 'Segoe UI', Arial, sans-serif; text-align: center; padding: 10px; }
-    .header { color: #f0b90b; margin-bottom: 20px; }
-    .stats { display: flex; max-width: 1000px; margin: auto; gap: 15px; }
-    .card { background: #1e2329; padding: 20px; border-radius: 12px; border-bottom: 4px solid #f0b90b; flex: 1; }
-    table { width: 100%; max-width: 1000px; margin: 25px auto; border-collapse: collapse; background: #1e2329; border-radius: 8px; overflow: hidden; }
+    body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; }
+    .container { max-width: 1000px; margin: auto; }
+    .card { background: #1e2329; padding: 20px; border-radius: 10px; border-bottom: 4px solid #f0b90b; margin: 10px; flex: 1; }
+    table { width: 100%; border-collapse: collapse; background: #1e2329; margin-top: 20px; border-radius: 8px; overflow: hidden; }
     th { background: #2b3139; padding: 12px; color: #848e9c; font-size: 13px; }
     td { padding: 12px; border-bottom: 1px solid #2b3139; }
-    .up { color: #0ecb81; } .down { color: #f6465d; }
-    .btn { background: #f6465d; color: white; padding: 5px 12px; border-radius: 4px; text-decoration: none; font-size: 12px; }
+    .up { color: #0ecb81; font-weight: bold; } .down { color: #f6465d; font-weight: bold; }
+    .btn { background: #f6465d; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; }
 </style></head><body>
-    <h2 class="header">🛰️ رادار التداول v310 | المحفظة الافتراضية</h2>
-    <div class="stats">
-        <div class="card">صافي الأرباح المحققة<br><b class="{{ 'up' if cp >= 0 else 'down' }}" style="font-size:24px;">${{ "%.2f"|format(cp) }}</b></div>
-        <div class="card">الأرباح العائمة (الآن)<br><b class="{{ 'up' if fp >= 0 else 'down' }}" style="font-size:24px;">${{ "%.2f"|format(fp) }}</b></div>
-        <div class="card">الصفقات المفتوحة<br><b style="font-size:24px;">{{ ot|length }} / 20</b></div>
+    <div class="container">
+        <h2 style="color:#f0b90b;">🛰️ رادار التداول v320</h2>
+        <div style="display:flex;">
+            <div class="card">الأرباح المحققة<br><b class="{{ 'up' if cp >= 0 else 'down' }}" style="font-size:22px;">${{ "%.2f"|format(cp) }}</b></div>
+            <div class="card">الصفقات المفتوحة<br><b style="font-size:22px;">{{ ot|length }} / 20</b></div>
+        </div>
+        <table>
+            <tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>الهدف</th><th>الوقف</th><th>الربح ($)</th><th>إجراء</th></tr>
+            {% for t in ot %}
+            {% set pnl = ((t.current_price - t.entry_price) / t.entry_price) * 1000 %}
+            <tr>
+                <td><b>{{ t.symbol }}</b></td>
+                <td>${{ "%.4f"|format(t.entry_price) }}</td>
+                <td style="color:#f0b90b;">${{ "%.4f"|format(t.current_price) }}</td>
+                <td class="up">${{ "%.4f"|format(t.tp_price) }}</td>
+                <td class="down">${{ "%.4f"|format(t.sl_price) }}</td>
+                <td class="{{ 'up' if pnl >= 0 else 'down' }}">${{ "%.2f"|format(pnl) }}</td>
+                <td><a href="/close/{{ t.symbol }}" class="btn">إغلاق</a></td>
+            </tr>
+            {% endfor %}
+        </table>
     </div>
-    <table>
-        <tr><th>العملة</th><th>الدخول</th><th>الحالي</th><th>الهدف (TP)</th><th>الوقف (SL)</th><th>الربح ($)</th><th>تحكم</th></tr>
-        {% for t in ot %}
-        {% set pnl = ((t.current_price - t.entry_price) / t.entry_price) * 1000 %}
-        <tr>
-            <td><b>{{ t.symbol }}</b><br><small style="color:#848e9c;">{{ t.open_time }}</small></td>
-            <td>${{ "%.4f"|format(t.entry_price) }}</td>
-            <td style="color:#f0b90b; font-weight:bold;">${{ "%.4f"|format(t.current_price) }}</td>
-            <td class="up">${{ "%.4f"|format(t.tp_price) }}</td>
-            <td class="down">${{ "%.4f"|format(t.sl_price) }}</td>
-            <td class="{{ 'up' if pnl >= 0 else 'down' }}">${{ "%.2f"|format(pnl) }}</td>
-            <td><a href="/close/{{ t.symbol }}" class="btn">إغلاق</a></td>
-        </tr>
-        {% endfor %}
-    </table>
-    <h3 style="color:#848e9c;">سجل آخر 10 صفقات مغلقة</h3>
-    <table>
-        <tr style="background:#161a1e;"><th>العملة</th><th>النتيجة</th><th>سبب الإغلاق</th><th>الوقت</th></tr>
-        {% for c in ct %}
-        <tr><td>{{ c.symbol }}</td><td class="{{ 'up' if c.pnl >= 0 else 'down' }}">${{ "%.2f"|format(c.pnl) }}</td><td>{{ c.exit_reason }}</td><td>{{ c.close_time }}</td></tr>
-        {% endfor %}
-    </table>
 </body></html>
 """
 
@@ -142,18 +149,16 @@ def index():
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
         ot = cur.fetchall()
-        cur.execute("SELECT * FROM closed_trades ORDER BY id DESC LIMIT 10")
-        ct = cur.fetchall()
         cur.execute("SELECT SUM(pnl) FROM closed_trades")
         res = cur.fetchone()
         cp = float(res[0]) if res and res[0] else 0.0
         cur.close(); conn.close()
-        fp = sum([((t['current_price'] - t['entry_price']) / t['entry_price']) * 1000 for t in ot])
-        return render_template_string(HTML, ot=ot, ct=ct, cp=cp, fp=fp)
-    except: return "<h1>جاري المزامنة... أعد التحميل</h1>"
+        return render_template_string(HTML_TEMPLATE, ot=ot, cp=cp)
+    except:
+        return "<h1>جاري الاتصال بقاعدة البيانات... أعد التحميل</h1>", 500
 
 @app.route('/close/<symbol>')
-def close_manual(symbol):
+def manual_close(symbol):
     conn = get_db_connection()
     if conn:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
@@ -162,7 +167,7 @@ def close_manual(symbol):
         if t:
             pnl = ((t['current_price'] - t['entry_price']) / t['entry_price']) * 1000
             cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)",
-                        (t['symbol'], t['entry_price'], t['current_price'], pnl, "إغلاق يدوي", datetime.now().strftime('%m-%d %H:%M')))
+                        (t['symbol'], t['entry_price'], t['current_price'], pnl, "يدوي", datetime.now().strftime('%m-%d %H:%M')))
             cur.execute("DELETE FROM trades WHERE symbol = %s", (symbol,))
             conn.commit()
         cur.close(); conn.close()
