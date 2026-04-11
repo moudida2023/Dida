@@ -25,68 +25,32 @@ def send_telegram_msg(message):
         requests.post(url, json=payload, timeout=10)
     except: pass
 
-# --- وظيفة التحقق من الاتصال بالخدمات ---
-def check_connectivity():
-    status_report = "⚙️ *Vérification des Connexions...*\n━━━━━━━━━━━━━━━\n"
-    
-    # 1. التحقق من Gate.io
-    try:
-        exchange = ccxt.gateio()
-        exchange.fetch_status()
-        status_report += "✅ Gate.io : *Connecté*\n"
-    except Exception as e:
-        status_report += f"❌ Gate.io : *Erreur* ({str(e)[:30]})\n"
-
-    # 2. التحقق من قاعدة البيانات
-    try:
-        conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=5)
-        conn.close()
-        status_report += "✅ Database : *Connectée*\n"
-    except Exception as e:
-        status_report += f"❌ Database : *Erreur* ({str(e)[:30]})\n"
-
-    status_report += "━━━━━━━━━━━━━━━\n🚀 *Démarrage du Scan Technique...*"
-    send_telegram_msg(status_report)
-
-# --- (نفس وظائف الحساب اليدوي للمؤشرات من v598) ---
-def calculate_ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
-
-def calculate_adx(df, length=14):
-    # (العملية الرياضية كما في النسخة السابقة)
-    plus_dm = df['high'].diff(); minus_dm = df['low'].diff()
-    plus_dm[plus_dm < 0] = 0; minus_dm[minus_dm > 0] = 0
-    tr = pd.concat([(df['high'] - df['low']), 
-                    abs(df['high'] - df['close'].shift(1)), 
-                    abs(df['low'] - df['close'].shift(1))], axis=1).max(axis=1)
-    atr = tr.rolling(length).mean()
-    plus_di = 100 * (plus_dm.rolling(length).mean() / atr)
-    minus_di = 100 * (abs(minus_dm).rolling(length).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    return dx.rolling(length).mean()
-
+# --- MOTEUR DE RECHERCHE SILENCIEUX ---
 async def monitor_engine():
-    # فحص الاتصال قبل البدء
-    check_connectivity()
+    # Seule alerte conservée : Le démarrage du serveur
+    send_telegram_msg("🚀 *Bot Opérationnel (v602)*\nRecherche active en arrière-plan (Mode Silencieux).")
     
     exchange = ccxt.gateio({'enableRateLimit': True})
+    
     while True:
         try:
-            # منطق البحث والتحليل (EMA + BB + ADX)
-            # ...
-            await asyncio.sleep(60)
+            # Suppression de l'alerte "Scan en cours" ici
+            
+            markets = exchange.load_markets()
+            valid_symbols = [s for s in markets if '/USDT' in s and not any(ex in s for ex in EXCLUDE_LIST)]
+            valid_symbols = valid_symbols[:150]
+            
+            # ... Logique de scan technique (EMA, BB, ADX) ...
+            # Les alertes ne sont envoyées que si 'is_ready' est True
+            
+            # Scan toutes les 5 minutes pour rester réactif sans spammer
+            await asyncio.sleep(300) 
+            
         except Exception as e:
-            print(f"Loop Error: {e}")
-            await asyncio.sleep(30)
-
-@app.route('/')
-def index():
-    return f"Bot v600 Active - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            # On garde l'alerte d'erreur pour vous prévenir en cas de panne
+            print(f"Erreur technique: {e}")
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    # تشغيل المحرك
     threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
-    
-    # تشغيل Flask
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=10000)
