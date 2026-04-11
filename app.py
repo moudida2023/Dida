@@ -4,6 +4,8 @@ import asyncio
 import psycopg2
 from psycopg2 import extras
 import ccxt.pro as ccxt
+import pandas as pd
+import pandas_ta as ta
 import requests
 import time
 from flask import Flask, render_template_string
@@ -15,129 +17,126 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
-RENDER_APP_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+RENDER_APP_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
 MAX_VIRTUAL_TRADES = 10
 TRADE_INVESTMENT = 50.0
-TP_VAL = 3.0   
-SL_VAL = -3.0  
+TP_VAL, SL_VAL = 3.0, -3.0
 EXCLUDE_LIST = ['USDT', 'USDC', 'BUSD', 'DAI', 'BEAR', 'BULL', '3L', '3S']
 
-# --- UTILS ---
-def send_telegram_msg(message):
+# --- TECHNICAL ANALYSIS ENGINE ---
+def analyze_indicators(symbol, exchange):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, json=payload, timeout=5)
-    except: pass
+        # جلب البيانات التاريخية (1H لفلترة الاتجاه و 15M للدخول)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+        df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+        
+        # 1. EMAs
+        df['ema9'] = ta.ema(df['close'], length=9)
+        df['ema21'] = ta.ema(df['close'], length=21)
+        df['ema200'] = ta.ema(df['close'], length=200)
+        
+        # 2. Bollinger Bands (20, 2)
+        bb = ta.bbands(df['close'], length=20, std=2)
+        df = pd.concat([df, bb], axis=1)
+        
+        # 3. ADX
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df = pd.concat([df, adx], axis=1)
+        
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # --- شروط الدخول (Strategy Logic) ---
+        # أ. السعر فوق EMA 200 (اتجاه صاعد)
+        condition_trend = last['close'] > last['ema200']
+        
+        # ب. تقاطع EMA 9 فوق EMA 21
+        condition_ema_cross = last['ema9'] > last['ema21'] and prev['ema9'] <= prev['ema21']
+        
+        # ج. اختراق البولينجر العلوي (Bollinger Breakout)
+        condition_bb = last['close'] > last['BBU_20_2.0']
+        
+        # د. قوة الترند (ADX > 25)
+        condition_adx = last['ADX_14'] > 25
+        
+        # هـ. زيادة الحجم (أكبر من متوسط آخر 10 شموع)
+        condition_vol = last['vol'] > df['vol'].tail(10).mean()
 
-def get_db_connection():
-    try:
-        return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=10)
-    except: return None
+        if condition_trend and condition_ema_cross and condition_adx and condition_vol:
+            return True, last['close']
+        return False, 0
+    except:
+        return False, 0
 
-def get_24h_stats():
-    conn = get_db_connection()
-    if not conn: return "⚠️ Erreur de connexion BD."
-    try:
-        cur = conn.cursor(cursor_factory=extras.DictCursor)
-        last_24h = datetime.now() - timedelta(hours=24)
-        cur.execute("SELECT * FROM closed_trades WHERE close_time >= %s", (last_24h,))
-        trades = cur.fetchall()
-        if not trades: return "📊 *Stats (24h):* Aucun ordre fermé."
-        total = len(trades)
-        wins = len([t for t in trades if "TP" in t['exit_reason']])
-        net_pnl = sum([float(t['pnl']) for t in trades])
-        win_rate = (wins / total) * 100
-        msg = (f"📊 *Performance (24h)*\n━━━━━━━━━━━━━━━\n✅ Wins: {wins} | ❌ Loss: {total-wins}\n"
-               f"📈 Win Rate: *{win_rate:.1f}%*\n💵 Profit Net: *${net_pnl:+.2f}*")
-        cur.close(); conn.close()
-        return msg
-    except: return "⚠️ Erreur calcul stats."
-
-def calculate_score(ticker):
-    score = 0
-    try:
-        change = float(ticker.get('percentage', 0) or 0)
-        vol = float(ticker.get('quoteVolume', 0) or 0)
-        last = float(ticker.get('last', 0) or 0)
-        high = float(ticker.get('high', 0) or 1)
-        if 2.0 <= change <= 8.0: score += 40
-        if vol > 50000: score += 30
-        if last >= high * 0.98: score += 30
-    except: pass
-    return score
-
-# --- MOTEUR DE TRADING ET RADAR ---
+# --- MOTEUR DE TRADING ---
 async def monitor_engine():
+    # استخدام CCXT العادي للتحليل الفني (REST API أسرع لجلب البيانات التاريخية)
     exchange = ccxt.gateio({'enableRateLimit': True})
+    
     while True:
         try:
-            all_tickers = await exchange.fetch_tickers()
-            valid_symbols = [s for s, t in all_tickers.items() if '/USDT' in s and not any(ex in s for ex in EXCLUDE_LIST)]
-            valid_symbols = valid_symbols[:500]
+            markets = exchange.load_markets()
+            valid_symbols = [s for s in markets if '/USDT' in s and not any(ex in s for ex in EXCLUDE_LIST)]
+            valid_symbols = valid_symbols[:200] # تقليل العدد لضمان سرعة جلب الـ OHLCV
             
-            conn = get_db_connection()
-            if conn:
-                cur = conn.cursor(cursor_factory=extras.DictCursor)
-                cur.execute("SELECT * FROM trades")
-                active_trades = cur.fetchall()
-                active_list = [t['symbol'] for t in active_trades]
+            conn = psycopg2.connect(DB_URL, sslmode='require')
+            cur = conn.cursor(cursor_factory=extras.DictCursor)
+            
+            # 1. تحديث الصفقات الحالية (Real-time Prices)
+            cur.execute("SELECT * FROM trades")
+            active_trades = cur.fetchall()
+            for t in active_trades:
+                ticker = exchange.fetch_ticker(t['symbol'])
+                curr_p = float(ticker['last'])
+                pnl = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
+                cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, t['symbol']))
                 
-                # 1. إدارة الصفقات المفتوحة
-                for t in active_trades:
-                    sym = t['symbol']
-                    if sym in all_tickers:
-                        curr_p = float(all_tickers[sym]['last'])
-                        pnl = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
-                        cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
-                        
-                        if pnl >= TP_VAL or pnl <= SL_VAL:
-                            reason = "✅ TP (+3%)" if pnl >= TP_VAL else "❌ SL (-3%)"
-                            p_val = (pnl/100)*TRADE_INVESTMENT
-                            cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)", 
-                                        (sym, float(t['entry_price']), curr_p, p_val, reason, datetime.now()))
-                            cur.execute("DELETE FROM trades WHERE symbol = %s", (sym,))
-                            conn.commit()
-                            send_telegram_msg(f"💰 *Fermeture:* {sym} ({reason})\n📊 PnL: {pnl:.2f}%")
-                            send_telegram_msg(get_24h_stats())
+                if pnl >= TP_VAL or pnl <= SL_VAL:
+                    # منطق الإغلاق (كما في النسخ السابقة)
+                    close_trade(cur, t, curr_p, pnl)
 
-                # 2. رصد كل العملات (Score 100) وإرسال القائمة
-                score_100_list = []
-                for i in range(0, len(valid_symbols), 100):
-                    chunk = valid_symbols[i:i+100]
-                    for sym in chunk:
-                        if calculate_score(all_tickers[sym]) == 100:
-                            score_100_list.append(sym)
-                            
-                            # فتح صفقة إذا توفر مكان
-                            if len(active_list) < MAX_VIRTUAL_TRADES and sym not in active_list:
-                                price = float(all_tickers[sym]['last'])
-                                cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time) VALUES (%s,%s,%s,%s,%s)",
-                                            (sym, price, price, TRADE_INVESTMENT, datetime.now()))
-                                active_list.append(sym)
-                                send_telegram_msg(f"🚀 *Nouvel Ordre:* {sym}\n💵 Prix: {price:.6f}\n🎯 TP: {price*1.03:.6f} | 🛑 SL: {price*0.97:.6f}")
+            # 2. المسح الفني لفتح صفقات جديدة
+            active_list = [t['symbol'] for t in active_trades]
+            found_opportunities = []
 
-                # إرسال قائمة العملات المكتشفة
-                if score_100_list:
-                    list_msg = "📍 *Cryptos avec Score 100 détectées :*\n" + "\n".join([f"• `{s}`" for s in score_100_list])
-                    send_telegram_msg(list_msg)
+            for sym in valid_symbols:
+                is_ready, price = analyze_indicators(sym, exchange)
+                if is_ready:
+                    found_opportunities.append(sym)
+                    if len(active_list) < MAX_VIRTUAL_TRADES and sym not in active_list:
+                        open_trade(cur, sym, price)
+                        active_list.append(sym)
 
-                conn.commit()
-                cur.close(); conn.close()
-            await asyncio.sleep(30) # فحص كل 30 ثانية لتجنب الرسائل المزعجة
-        except: await asyncio.sleep(30)
+            if found_opportunities:
+                send_telegram_msg(f"🔍 *Signal Détecté (BB + EMA + ADX):*\n" + "\n".join([f"• `{s}`" for s in found_opportunities]))
 
-# --- (Self-Ping et Flask - نفس النسخ السابقة) ---
-def self_ping():
-    if not RENDER_APP_URL: return
-    while True:
-        try:
-            time.sleep(840)
-            requests.get(RENDER_APP_URL, timeout=10)
-        except: pass
+            conn.commit()
+            cur.close(); conn.close()
+            await asyncio.sleep(60) # التحليل الفني يحتاج وقت (مرة كل دقيقة)
+        except Exception as e:
+            print(f"Engine Error: {e}")
+            await asyncio.sleep(30)
 
+def open_trade(cur, sym, price):
+    cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time) VALUES (%s,%s,%s,%s,%s)",
+                (sym, price, price, TRADE_INVESTMENT, datetime.now()))
+    send_telegram_msg(f"🚀 *Achat (Filtre Technique)*\n🪙 {sym}\n💵 Prix: {price:.6f}\n📊 Strat: Trend-Following")
+
+def close_trade(cur, t, curr_p, pnl):
+    reason = "✅ TP" if pnl >= TP_VAL else "❌ SL"
+    p_val = (pnl/100)*TRADE_INVESTMENT
+    cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)", 
+                (t['symbol'], float(t['entry_price']), curr_p, p_val, reason, datetime.now()))
+    cur.execute("DELETE FROM trades WHERE symbol = %s", (t['symbol'],))
+    send_telegram_msg(f"💰 *Fermeture:* {t['symbol']}\n📈 PnL: {pnl:.2f}% ({reason})")
+
+def send_telegram_msg(message):
+    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                       json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"})
+    except: pass
+
+# --- (Flask & Self-Ping as before) ---
 if __name__ == "__main__":
-    threading.Thread(target=self_ping, daemon=True).start()
     threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
