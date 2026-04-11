@@ -106,4 +106,47 @@ def index():
 
         <h4 style="color:#f0b90b; text-align:right;">📍 صفقات حية</h4>
         <table>
-            <tr><th>العملة</th><th>الربح %</th><th>أعلى/أدنى</th><th>إجراء</th>
+            <tr><th>العملة</th><th>الربح %</th><th>أعلى/أدنى</th><th>إجراء</th></tr>
+            {% for t in active %}
+            {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 100 %}
+            <tr>
+                <td><b>{{ t.symbol.split('/')[0] }}</b></td>
+                <td class="{{ 'up' if p >= 0 else 'down' }}">{{ "%.2f"|format(p) }}%</td>
+                <td><small class="up">+{{ "%.1f"|format(t.max_asc or 0) }}</small> / <small class="down">{{ "%.1f"|format(t.max_desc or 0) }}</small></td>
+                <td>
+                    <form action="/close/{{ t.symbol }}" method="post" style="display:inline;">
+                        <button type="submit" class="btn-close">X إغلاق</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </body></html>
+    """, net=net_val, active=active_trades)
+
+# --- محرك التداول --- (نفس المحرك السابق مع الحفاظ على تحديث max_asc/max_desc)
+async def trading_engine():
+    global last_scan_results
+    exchange = ccxt.gateio({'enableRateLimit': True})
+    while True:
+        try:
+            tickers = await exchange.fetch_tickers()
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor(cursor_factory=extras.DictCursor)
+                cur.execute("SELECT * FROM trades")
+                active_t = cur.fetchall()
+                for t in active_t:
+                    if t['symbol'] in tickers:
+                        curr_p = float(tickers[t['symbol']]['last'])
+                        pnl = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
+                        m_a = max(float(t['max_asc'] or 0), pnl)
+                        m_d = min(float(t['max_desc'] or 0), pnl)
+                        cur.execute("UPDATE trades SET current_price=%s, max_asc=%s, max_desc=%s WHERE symbol=%s", (curr_p, m_a, m_d, t['symbol']))
+                conn.commit(); cur.close(); conn.close()
+            await asyncio.sleep(15)
+        except: await asyncio.sleep(15)
+
+if __name__ == "__main__":
+    threading.Thread(target=lambda: asyncio.run(trading_engine()), daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
