@@ -4,119 +4,125 @@ import asyncio
 import psycopg2
 from psycopg2 import extras
 import ccxt.pro as ccxt
-from flask import Flask, render_template_string, redirect, url_for, request, Response
-from datetime import datetime, timedelta
-import io
-import csv
+import requests
+from flask import Flask
+from datetime import datetime
 
 app = Flask(__name__)
 
-# --- Configuration de la Base de Données ---
+# --- إعداداتك الفنية ---
+TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
+TELEGRAM_CHAT_ID = '5067771509'
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
-TAKE_PROFIT = 5.0
-STOP_LOSS = -5.0
-TRADE_AMOUNT = 50.0  
-MAX_TRADES = 20      
-status_indicators = {"db": "🔴", "exchange": "🔴", "server": "🟢"}
+
+# الإعدادات الفنية للتداول الافتراضي
+MAX_VIRTUAL_TRADES = 10
+TRADE_INVESTMENT = 50.0
+TP_PCT = 3.0
+SL_PCT = -2.0
+EXCLUDE_LIST = ['USDT', 'USDC', 'BUSD', 'DAI', 'BEAR', 'BULL', '3L', '3S']
+
+# حالة الاتصال الأولي
+db_initialized = False
+
+def send_telegram_msg(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=5)
+    except: pass
 
 def get_db_connection():
-    """Établit une connexion propre à la base de données"""
+    global db_initialized
     try:
         conn = psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=10)
-        status_indicators["db"] = "🟢"
+        if not db_initialized:
+            send_telegram_msg("✅ *Connexion avec succès* (Base de données connectée)")
+            db_initialized = True
         return conn
     except Exception as e:
-        print(f"Erreur de connexion BD: {e}")
-        status_indicators["db"] = "🔴"
+        print(f"Erreur DB: {e}")
         return None
 
 def calculate_score(ticker):
-    """Calcule le score de 100 points pour filtrer les paires"""
     score = 0
     try:
-        # On utilise .get() pour éviter les erreurs si une clé est manquante
         change = float(ticker.get('percentage', 0) or 0)
-        volume = float(ticker.get('quoteVolume', 0) or 0)
+        vol = float(ticker.get('quoteVolume', 0) or 0)
         last = float(ticker.get('last', 0) or 0)
         high = float(ticker.get('high', 0) or 1)
-
-        # Critère 1: Hausse saine (40 pts)
         if 2.0 <= change <= 8.0: score += 40
-        # Critère 2: Volume suffisant (30 pts)
-        if volume > 50000: score += 30
-        # Critère 3: Proche du plus haut / Momentum (30 pts)
+        if vol > 50000: score += 30
         if last >= high * 0.98: score += 30
     except: pass
     return score
 
-# --- Moteur d'Analyse et d'Enregistrement ---
+# --- المحرك الرئيسي المحسن ---
 async def monitor_engine():
     exchange = ccxt.gateio({'enableRateLimit': True})
+    
     while True:
         try:
-            # Récupération des prix
-            tickers = await exchange.fetch_tickers()
-            status_indicators["exchange"] = "🟢"
+            all_tickers = await exchange.fetch_tickers()
+            # تصفية وفحص أول 500 عملة
+            valid_symbols = [s for s, t in all_tickers.items() if '/USDT' in s and not any(ex in s for ex in EXCLUDE_LIST)]
+            valid_symbols = valid_symbols[:500]
             
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor(cursor_factory=extras.DictCursor)
                 
-                # 1. Mise à jour des trades existants dans la BD
+                # 1. تحديث الصفقات في الـ BD
                 cur.execute("SELECT * FROM trades")
                 active_trades = cur.fetchall()
+                active_list = [t['symbol'] for t in active_trades]
                 
-                for trade in active_trades:
-                    symbol = trade['symbol']
-                    if symbol in tickers:
-                        current_price = float(tickers[symbol]['last'])
-                        entry_price = float(trade['entry_price'])
-                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                for t in active_trades:
+                    sym = t['symbol']
+                    if sym in all_tickers:
+                        curr_p = float(all_tickers[sym]['last'])
+                        pnl = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
+                        cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
                         
-                        # Mise à jour du prix actuel et des records (Max/Min) dans la BD
-                        new_max = max(float(trade['max_asc'] or 0), pnl_pct)
-                        new_min = min(float(trade['max_desc'] or 0), pnl_pct)
-                        
-                        cur.execute("""
-                            UPDATE trades 
-                            SET current_price = %s, max_asc = %s, max_desc = %s 
-                            WHERE symbol = %s
-                        """, (current_price, new_max, new_min, symbol))
-                
-                # 2. Recherche et Enregistrement de nouvelles opportunités (Score 100)
-                if len(active_trades) < MAX_TRADES:
-                    for symbol, ticker in tickers.items():
-                        # Filtrage (USDT uniquement, pas de tokens à effet de levier)
-                        if '/USDT' in symbol and all(x not in symbol for x in ['BEAR', 'BULL', '3L', '3S']):
-                            if calculate_score(ticker) == 100:
-                                # Vérifier si le symbole est déjà enregistré
-                                cur.execute("SELECT 1 FROM trades WHERE symbol = %s", (symbol,))
-                                if not cur.fetchone():
-                                    price = float(ticker['last'])
-                                    # INSERTION DANS LA BD
+                        if pnl >= TP_PCT or pnl <= SL_PCT:
+                            reason = "✅ TP +3%" if pnl >= TP_PCT else "❌ SL -2%"
+                            p_val = (pnl / 100) * TRADE_INVESTMENT
+                            cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s,%s,%s,%s,%s,%s)", 
+                                        (sym, float(t['entry_price']), curr_p, p_val, reason, datetime.now()))
+                            cur.execute("DELETE FROM trades WHERE symbol = %s", (sym,))
+                            send_telegram_msg(f"💰 *Fermeture d'ordre*\n🪙 {sym}\n📊 Résultat: {reason}\n💵 PnL: ${p_val:.2f}")
+
+                # 2. البحث عن سكور 100 والحفظ مع تأكيد الإضافة
+                all_found_100 = []
+                for i in range(0, len(valid_symbols), 100):
+                    chunk = valid_symbols[i:i+100]
+                    for sym in chunk:
+                        if calculate_score(all_tickers[sym]) == 100:
+                            all_found_100.append(sym)
+                            if len(active_list) < MAX_VIRTUAL_TRADES and sym not in active_list:
+                                price = float(all_tickers[sym]['last'])
+                                
+                                # محاولة الإضافة في قاعدة البيانات
+                                try:
                                     cur.execute("""
                                         INSERT INTO trades (symbol, entry_price, current_price, investment, open_time, max_asc, max_desc) 
                                         VALUES (%s, %s, %s, %s, %s, 0, 0)
-                                    """, (symbol, price, price, TRADE_AMOUNT, datetime.now()))
-                                    print(f"💰 Opportunité trouvée et enregistrée : {symbol}")
+                                    """, (sym, price, price, TRADE_INVESTMENT, datetime.now()))
+                                    
+                                    # إرسال تنبيه في حال نجاح الإضافة فقط
+                                    send_telegram_msg(f"🚀 *Nouvel ordre (Score 100)*\n🪙 Symbole: {sym}\n💵 Prix: {price}\n✅ *Données enregistrées avec succès dans la BD*")
+                                    active_list.append(sym)
+                                except Exception as db_err:
+                                    send_telegram_msg(f"⚠️ *Erreur d'enregistrement BD* pour {sym}: {db_err}")
 
-                conn.commit() # Validation des changements
-                cur.close()
-                conn.close()
+                conn.commit()
+                cur.close(); conn.close()
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(20)
         except Exception as e:
-            print(f"Erreur moteur: {e}")
-            status_indicators["exchange"] = "🔴"
-            await asyncio.sleep(15)
-
-# --- Routes Flask ---
-@app.route('/')
-def index():
-    # Logique d'affichage identique à votre version stable
-    return render_template_string("... (Votre HTML) ...")
+            print(f"Global Error: {e}")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # Lancement du moteur dans un thread séparé
     threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=10000)
