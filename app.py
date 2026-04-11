@@ -1,94 +1,98 @@
 import os
 import threading
 import asyncio
-import ccxt.pro as ccxt
 import psycopg2
 from psycopg2 import extras
+import ccxt.pro as ccxt
 from flask import Flask, render_template_string
 from datetime import datetime
 
 app = Flask(__name__)
 
-# --- الإعدادات ---
-DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a/trading_bot_db_wv1h"
-status_db = "🔴"
-status_ex = "🔴"
+# --- إعدادات قاعدة البيانات (الرابط الخارجي الموثوق) ---
+DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
 
 def get_db_connection():
-    global status_db
     try:
-        url = DB_URL.replace("postgres://", "postgresql://", 1) if DB_URL.startswith("postgres://") else DB_URL
-        conn = psycopg2.connect(url, connect_timeout=5)
-        status_db = "🟢"
+        # ضروري جداً: استخدام sslmode=require للاتصال بقواعد Render الخارجية
+        conn = psycopg2.connect(DB_URL, sslmode='require', connect_timeout=10)
         return conn
     except Exception as e:
-        status_db = "🔴"
-        print(f"!!! DATABASE ERROR: {e}") # سيظهر في الـ Logs
+        print(f"❌ DATABASE ERROR: {e}")
         return None
 
+# --- تهيئة الجداول عند أول تشغيل ---
+def init_db():
+    conn = get_db_connection()
+    if conn:
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS trades 
+            (symbol TEXT PRIMARY KEY, entry_price DOUBLE PRECISION, current_price DOUBLE PRECISION, 
+             tp_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, investment DOUBLE PRECISION, open_time TEXT)''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS closed_trades 
+            (id SERIAL PRIMARY KEY, symbol TEXT, entry_price DOUBLE PRECISION, exit_price DOUBLE PRECISION, 
+             pnl DOUBLE PRECISION, exit_reason TEXT, close_time TEXT)''')
+        conn.commit()
+        cur.close(); conn.close()
+        print("✅ Database Tables Verified/Created.")
+
+# --- محرك التداول (يعمل في الخلفية) ---
 async def trading_engine():
-    global status_ex
+    init_db()
     exchange = ccxt.gateio({'enableRateLimit': True})
-    
-    print("🚀 STARTING TRADING ENGINE...") # رسالة بدء المحرك
+    print("🚀 Trading Engine is Online...")
     
     while True:
         try:
-            # 1. فحص الاتصال بالبورصة
-            await exchange.load_markets()
-            status_ex = "🟢"
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Connection to Gate.io: OK")
-
-            # 2. فحص الاتصال بالقاعدة
             conn = get_db_connection()
-            if conn:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Connection to DB: OK")
-                cur = conn.cursor(cursor_factory=extras.DictCursor)
-                
-                # تحديث الأسعار (مثال)
-                cur.execute("SELECT symbol FROM trades")
-                rows = cur.fetchall()
-                print(f"📊 Monitoring {len(rows)} active trades.")
-                
-                cur.close()
-                conn.close()
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ DB Connection Failed!")
-
-            await asyncio.sleep(30) # فحص كل 30 ثانية لتجنب ازدحام الـ Logs
+            if not conn:
+                await asyncio.sleep(20); continue
             
+            # هنا يمكنك إضافة منطق فتح وإغلاق الصفقات الفعلي
+            # حالياً البوت سيقوم بطباعة رسالة تأكيد الاتصال فقط في الـ Logs
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚙️ Engine: Connection Active")
+            
+            conn.close()
+            await asyncio.sleep(60) 
         except Exception as e:
-            status_ex = "🔴"
-            print(f"⚠️ ENGINE CRITICAL ERROR: {e}")
-            await asyncio.sleep(30)
+            print(f"⚠️ Engine Loop Error: {e}")
+            await asyncio.sleep(20)
 
-# --- واجهة الويب ---
+# --- الواجهة الرسومية ---
+HTML_PAGE = """
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+<title>Radar v400</title>
+<style>
+    body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding-top: 50px; }
+    .status-box { background: #1e2329; padding: 30px; display: inline-block; border-radius: 12px; border: 1px solid #2b3139; }
+    .status-on { color: #0ecb81; font-weight: bold; }
+    .status-off { color: #f6465d; font-weight: bold; }
+</style></head><body>
+    <div class="status-box">
+        <h2 style="color:#f0b90b;">🛰️ نظام الرصد v400</h2>
+        <p>حالة قاعدة البيانات: <span class="{{ 'status-on' if db_ok else 'status-off' }}">{{ '🟢 متصلة' if db_ok else '🔴 غير متصلة' }}</span></p>
+        <p>توقيت السيرفر: {{ now }}</p>
+        <hr style="border:0; border-top:1px solid #2b3139;">
+        <p style="font-size:12px; color:#848e9c;">افحص شاشة Logs في Render للتفاصيل التقنية.</p>
+    </div>
+</body></html>
+"""
+
 @app.route('/')
 def index():
-    # طباعة رسالة عند كل زيارة للموقع
-    print(f"🌐 Website visited at {datetime.now().strftime('%H:%M:%S')}")
+    conn = get_db_connection()
+    db_ok = True if conn else False
+    if conn: conn.close()
     
-    html = f"""
-    <body style="background:#0b0e11; color:white; font-family:sans-serif; text-align:center; padding:50px;">
-        <h1 style="color:#f0b90b;">🛰️ نظام الرصد v340</h1>
-        <div style="background:#1e2329; padding:20px; border-radius:10px; display:inline-block;">
-            <p>حالة قاعدة البيانات: <b>{status_db}</b></p>
-            <p>حالة اتصال البورصة: <b>{status_ex}</b></p>
-            <hr>
-            <p>افحص شاشة <b>Logs</b> في Render لرؤية تفاصيل العمليات.</p>
-        </div>
-    </body>
-    """
-    return render_template_string(html)
+    print(f"🌐 Dashboard Access: DB Status {'OK' if db_ok else 'FAILED'}")
+    return render_template_string(HTML_PAGE, db_ok=db_ok, now=datetime.now().strftime('%H:%M:%S'))
 
 if __name__ == "__main__":
-    # رسالة عند تشغيل السيرفر لأول مرة
-    print("🔥 SERVER BOOTING UP...")
-    
+    # تشغيل محرك التداول في خيط منفصل
     t = threading.Thread(target=lambda: asyncio.run(trading_engine()))
     t.daemon = True
     t.start()
     
+    # تشغيل تطبيق Flask
     port = int(os.environ.get("PORT", 10000))
-    print(f"📡 Web server starting on port {port}")
     app.run(host='0.0.0.0', port=port)
