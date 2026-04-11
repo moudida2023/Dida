@@ -36,13 +36,13 @@ def execute_close_logic(symbol, exit_price, reason="Auto"):
             inv = float(trade['investment'])
             ent = float(trade['entry_price'])
             pnl = ((float(exit_price) - ent) / ent) * inv
-            cur.execute("""INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) 
-                           VALUES (%s, %s, %s, %s, %s, %s)""", 
+            cur.execute("INSERT INTO closed_trades (symbol, entry_price, exit_price, pnl, exit_reason, close_time) VALUES (%s, %s, %s, %s, %s, %s)", 
                         (symbol, ent, float(exit_price), pnl, reason, datetime.now()))
             cur.execute("UPDATE wallet SET balance = balance + %s WHERE id = 1", (pnl,))
             cur.execute("DELETE FROM trades WHERE symbol = %s", (symbol,))
             conn.commit()
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
     except Exception:
         if conn: conn.close()
 
@@ -63,23 +63,18 @@ def manual_close(symbol):
 @app.route('/')
 def index():
     conn = get_db_connection()
-    active_trades = []
-    closed_history = []
+    active_trades, closed_history = [], []
     realized_24h, floating, balance = 0.0, 0.0, 0.0
     
     if conn:
         try:
             cur = conn.cursor(cursor_factory=extras.DictCursor)
-            # جلب الصفقات النشطة
             cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
             active_trades = cur.fetchall()
-            # جلب آخر 20 صفقة مغلقة للسجل
-            cur.execute("SELECT * FROM closed_trades ORDER BY close_time DESC LIMIT 20")
+            cur.execute("SELECT * FROM closed_trades ORDER BY close_time DESC LIMIT 15")
             closed_history = cur.fetchall()
-            # حساب أرباح آخر 24 ساعة
             cur.execute("SELECT pnl FROM closed_trades WHERE close_time > %s", (datetime.now() - timedelta(hours=24),))
             realized_24h = sum(float(c[0]) for c in cur.fetchall())
-            # المحفظة والربح العائم
             cur.execute("SELECT balance FROM wallet WHERE id = 1")
             row = cur.fetchone()
             balance = float(row[0]) if row else 0.0
@@ -88,11 +83,83 @@ def index():
         except Exception:
             if conn: conn.close()
 
-    html_template = """
+    # القالب مفصول لضمان عدم حدوث SyntaxError
+    return render_template_string("""
     <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
     <style>
         body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 5px; margin: 0; }
-        .status-bar { background: #1e2329; padding: 5px; font-size: 10px; border-bottom: 1px solid #2b3139; display: flex; justify-content: space-around; }
+        .status { background: #1e2329; padding: 5px; font-size: 10px; border-bottom: 1px solid #2b3139; display: flex; justify-content: space-around; }
         .card { background: #1e2329; padding: 15px; border-radius: 15px; border: 1px solid #f0b90b; margin: 10px; }
-        .total-val { font-size: 35px; font-weight: bold; color: #f0b90b; }
-        .stat-box { background: #161a1e; padding: 10px; border-radius: 10px; width: 48%; display: inline-block; box-sizing: border
+        .stat-box { background: #161a1e; padding: 10px; border-radius: 10px; width: 48%; display: inline-block; box-sizing: border-box; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+        th { background: #2b3139; color: #848e9c; padding: 8px; }
+        td { padding: 12px 5px; border-bottom: 1px solid #2b3139; }
+        .up { color: #0ecb81; font-weight: bold; } .down { color: #f6465d; font-weight: bold; }
+        .btn { background: #f6465d; color: white; border: none; padding: 8px 12px; border-radius: 5px; font-weight: bold; }
+    </style></head><body>
+        <div class="status">
+            <span>Server: {{ st.server }}</span> <span>DB: {{ st.db }}</span> <span>Exchange: {{ st.exchange }}</span>
+        </div>
+        <div class="card">
+            <div style="font-size:32px; font-weight:bold; color:#f0b90b;">${{ "%.2f"|format(balance + 1000 + floating) }}</div>
+            <div style="margin-top:10px;">
+                <div class="stat-box"><small>محقق 24h</small><br><span class="{{ 'up' if realized >= 0 else 'down' }}">${{ "%.2f"|format(realized) }}</span></div>
+                <div class="stat-box"><small>عائم الآن</small><br><span class="{{ 'up' if floating >= 0 else 'down' }}">${{ "%.2f"|format(floating) }}</span></div>
+            </div>
+        </div>
+        <h3 style="text-align:right; margin-right:15px; color:#f0b90b;">📍 صفقات حية</h3>
+        <table>
+            <tr><th>العملة</th><th>الربح</th><th>Max/Min</th><th></th></tr>
+            {% for t in active %}
+            {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 100 %}
+            <tr>
+                <td style="text-align:right;"><b>{{ t.symbol.split('/')[0] }}</b><br><small style="color:#848e9c">${{ "%.4f"|format(t.entry_price) }}</small></td>
+                <td class="{{ 'up' if p >= 0 else 'down' }}" style="font-size:18px;">{{ "%.2f"|format(p) }}%</td>
+                <td><small class="up">+{{ "%.1f"|format(t.max_asc or 0) }}</small><br><small class="down">{{ "%.1f"|format(t.max_desc or 0) }}</small></td>
+                <td><form action="/close/{{ t.symbol }}" method="post"><button type="submit" class="btn">X</button></form></td>
+            </tr>
+            {% endfor %}
+        </table>
+        <h3 style="text-align:right; margin-right:15px; color:#848e9c;">📜 السجل</h3>
+        <table style="background:#111417; font-size:12px;">
+            {% for h in history %}
+            <tr>
+                <td style="text-align:right;">{{ h.symbol.split('/')[0] }}</td>
+                <td class="{{ 'up' if h.pnl >= 0 else 'down' }}">${{ "%.2f"|format(h.pnl) }}</td>
+                <td>{{ h.close_time.strftime('%H:%M') }}</td>
+                <td><small>{{ h.exit_reason }}</small></td>
+            </tr>
+            {% endfor %}
+        </table>
+    </body></html>
+    """, st=status_indicators, balance=balance, floating=floating, realized=realized_24h, active=active_trades, history=closed_history)
+
+async def monitor_engine():
+    exchange = ccxt.gateio({'enableRateLimit': True})
+    while True:
+        try:
+            tickers = await exchange.fetch_tickers()
+            status_indicators["exchange"] = "🟢"
+            conn = get_db_connection()
+            if conn:
+                cur = conn.cursor(cursor_factory=extras.DictCursor)
+                cur.execute("SELECT * FROM trades")
+                for t in cur.fetchall():
+                    sym = t['symbol']
+                    if sym in tickers:
+                        curr_p = float(tickers[sym]['last'])
+                        p = ((curr_p - float(t['entry_price'])) / float(t['entry_price'])) * 100
+                        m_a = max(float(t['max_asc'] or 0), p)
+                        m_d = min(float(t['max_desc'] or 0), p)
+                        cur.execute("UPDATE trades SET current_price=%s, max_asc=%s, max_desc=%s WHERE symbol=%s", (curr_p, m_a, m_d, sym))
+                        if p >= TAKE_PROFIT: execute_close_logic(sym, curr_p, "TP +5%")
+                        elif p <= STOP_LOSS: execute_close_logic(sym, curr_p, "SL -5%")
+                conn.commit(); cur.close(); conn.close()
+            await asyncio.sleep(8)
+        except Exception:
+            status_indicators["exchange"] = "🔴"
+            await asyncio.sleep(10)
+
+if __name__ == "__main__":
+    threading.Thread(target=lambda: asyncio.run(monitor_engine()), daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
