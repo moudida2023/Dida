@@ -11,37 +11,62 @@ import time
 
 app = Flask(__name__)
 
-# --- الإعدادات ---
+# --- الإعدادات الأساسية ---
 INITIAL_CAPITAL = 1000.0
 INVESTMENT_PER_TRADE = 50.0
-# الرابط الخارجي الكامل مع SSL
+ENTRY_SCORE_THRESHOLD = 85   # عتبة الدخول (سكور)
+TAKE_PROFIT_PCT = 0.02       # جني الأرباح (2%)
+STOP_LOSS_PCT = 0.012        # وقف الخسارة (1.2%)
+MAX_TRADES = 5               # أقصى عدد صفقات متزامنة
+
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
 RENDER_APP_URL = "https://dida-fvym.onrender.com"
 
+# --- إدارة قاعدة البيانات ---
 def get_db_connection():
     try:
-        # تحويل الرابط لنص صريح لضمان عدم حدوث خطأ النوع
         url = str(DB_URL).strip()
         return psycopg2.connect(url, sslmode='require', connect_timeout=15)
     except Exception as e:
-        print(f"❌ Connection Error: {e}")
+        print(f"❌ DB Connection Error: {e}")
         return None
 
-# وظيفة التنبيه الذاتي لمنع النوم
 def keep_alive():
+    """منع السيرفر من النوم عبر مراسلة نفسه"""
     while True:
         try:
             requests.get(RENDER_APP_URL, timeout=10)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔔 Self-Ping Sent: System Active")
-        except:
-            print("🔔 Self-Ping failed (No worries if server is rebooting)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔔 Self-Ping Sent")
+        except: pass
         time.sleep(600)
+
+# --- منطق الاستراتيجية (السكور) ---
+def calculate_trade_score(ticker):
+    """حساب السكور بناءً على البولينجر، الفوليوم، والزخم"""
+    score = 0
+    try:
+        # 1. تحليل التغير السعري (الزخم) - [30 نقطة]
+        change = float(ticker.get('percentage', 0) or 0)
+        if change > 2.5: score += 30
+        elif change > 1.0: score += 15
+
+        # 2. تحليل الفوليوم (السيولة) - [30 نقطة]
+        quote_vol = float(ticker.get('quoteVolume', 0) or 0)
+        if quote_vol > 1000000: score += 30
+        elif quote_vol > 500000: score += 15
+
+        # 3. اختراق البولينجر والقوة الشرائية - [40 نقطة]
+        last = float(ticker.get('last', 0) or 0)
+        high = float(ticker.get('high', 0) or 0)
+        if last >= (high * 0.985): score += 40  # قريب جداً من القمة (انفجار)
+        elif last >= (high * 0.96): score += 20
+    except: pass
+    return score
 
 def close_position(symbol, exit_price, reason):
     conn = get_db_connection()
     if not conn: return False
     try:
-        # تصحيح الخطأ: إضافة cursor_factory=
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades WHERE symbol = %s", (str(symbol),))
         t = cur.fetchone()
@@ -53,113 +78,111 @@ def close_position(symbol, exit_price, reason):
             cur.execute("UPDATE wallet SET balance = balance + %s WHERE id = 1", (pnl,))
             cur.execute("DELETE FROM trades WHERE symbol = %s", (str(symbol),))
             conn.commit()
+            print(f"✅ Closed {symbol} | Reason: {reason} | PnL: ${pnl:.2f}")
         cur.close(); conn.close()
         return True
     except Exception as e:
-        print(f"❌ Close Position Error: {e}")
+        print(f"❌ Error Closing: {e}")
         if conn: conn.close()
         return False
 
+# --- واجهة الويب (Dashboard) ---
 @app.route('/')
 def index():
     conn = get_db_connection()
-    if not conn: return "<h1>خطأ في الاتصال بقاعدة البيانات</h1>", 500
+    if not conn: return "DB Connection Error", 500
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
         cur.execute("SELECT * FROM trades ORDER BY open_time DESC")
-        ot = cur.fetchall()
+        active_trades = cur.fetchall()
         cur.execute("SELECT balance FROM wallet WHERE id = 1")
         res_w = cur.fetchone()
         realized_pnl = float(res_w[0]) if res_w else 0.0
         cur.close(); conn.close()
 
-        invested = len(ot) * INVESTMENT_PER_TRADE
+        invested = len(active_trades) * INVESTMENT_PER_TRADE
         unused = (INITIAL_CAPITAL + realized_pnl) - invested
-        floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in ot)
-        net = INITIAL_CAPITAL + realized_pnl + floating
+        floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in active_trades)
+        net_value = INITIAL_CAPITAL + realized_pnl + floating
 
         return render_template_string("""
-        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
         <style>
             body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; margin: 0; }
-            .card { background: #1e2329; padding: 15px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #f0b90b; }
-            .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 15px; }
-            .s-card { background: #1e2329; padding: 10px; border-radius: 8px; font-size: 12px; }
+            .card { background: #1e2329; padding: 15px; border-radius: 10px; border: 1px solid #f0b90b; margin-bottom: 15px; }
+            .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+            .s-box { background: #1e2329; padding: 10px; border-radius: 8px; border: 1px solid #2b3139; }
             .up { color: #0ecb81; } .down { color: #f6465d; }
-            .btn-all { background: #f6465d; color: white; padding: 12px; border-radius: 8px; text-decoration: none; display: block; margin: 15px 0; font-weight: bold; border: 1px solid white; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; }
-            th, td { padding: 8px; border: 1px solid #2b3139; }
+            table { width: 100%; border-collapse: collapse; font-size: 12px; }
+            th, td { padding: 10px; border: 1px solid #2b3139; }
         </style></head><body>
             <div class="card">
-                <small>صافي القيمة الكلية (24/7 نشط)</small><br>
-                <b style="font-size:26px;" class="{{ 'up' if net_val >= 1000 else 'down' }}">${{ "%.2f"|format(net_val) }}</b>
+                <small>صافي قيمة المحفظة (الآن)</small><br>
+                <b style="font-size:28px;" class="{{ 'up' if net >= 1000 else 'down' }}">${{ "%.2f"|format(net) }}</b>
             </div>
             <div class="stats">
-                <div class="s-card">المستعملة<br><b style="color:#f0b90b;">${{ "%.2f"|format(inv) }}</b></div>
-                <div class="s-card">غير المستعملة<br><b style="color:#92a2b1;">${{ "%.2f"|format(un) }}</b></div>
+                <div class="s-box">قيد التداول<br><b style="color:#f0b90b;">${{ "%.2f"|format(inv) }}</b></div>
+                <div class="s-box">رصيد متاح<br><b style="color:#92a2b1;">${{ "%.2f"|format(un) }}</b></div>
             </div>
-            {% if trades_list|length > 0 %}
-            <a href="/close_all" class="btn-all" onclick="return confirm('إغلاق الكل؟')">⚠️ إغلاق كافة الصفقات</a>
-            {% endif %}
-            <h4>📍 صفقات مفتوحة ({{ trades_list|length }})</h4>
+            <h4>📍 صفقات نشطة ({{ trades|length }})</h4>
             <table>
-                <tr><th>العملة</th><th>الحالي</th><th>الربح ($)</th></tr>
-                {% for t in trades_list %}
+                <tr><th>العملة</th><th>السعر</th><th>الربح</th></tr>
+                {% for t in trades %}
                 {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 50 %}
-                <tr><td>{{ t.symbol }}</td><td style="color:#f0b90b;">{{ t.current_price }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
+                <tr><td>{{ t.symbol }}</td><td>{{ t.current_price }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
                 {% endfor %}
             </table>
         </body></html>
-        """, inv=invested, un=unused, net_val=net, trades_list=ot)
-    except Exception as e:
-        return f"Error: {str(e)}", 500
+        """, net=net_value, inv=invested, un=unused, trades=active_trades)
+    except: return "Dashboard Error", 500
 
-@app.route('/close_all')
-def close_all_route():
-    try:
-        conn = get_db_connection()
-        if conn:
-            cur = conn.cursor(cursor_factory=extras.DictCursor)
-            cur.execute("SELECT symbol FROM trades")
-            trades = cur.fetchall()
-            cur.close(); conn.close()
-            if trades:
-                import ccxt as ccxt_sync
-                ex = ccxt_sync.gateio()
-                tickers = ex.fetch_tickers([str(t['symbol']) for t in trades])
-                for t in trades:
-                    s = str(t['symbol'])
-                    if s in tickers:
-                        close_position(s, float(tickers[s]['last']), "👤 إغلاق كلي")
-    except: pass
-    return redirect(url_for('index'))
-
+# --- محرك التداول الآلي ---
 async def trading_engine():
     exchange = ccxt.gateio({'enableRateLimit': True})
+    print("🚀 Trading Engine Starting...")
     while True:
         try:
-            await exchange.load_markets()
+            tickers = await exchange.fetch_tickers()
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor(cursor_factory=extras.DictCursor)
                 cur.execute("SELECT * FROM trades")
-                active = cur.fetchall()
-                if active:
-                    tickers = await exchange.fetch_tickers()
-                    for t in active:
-                        sym = str(t['symbol'])
-                        if sym in tickers:
-                            cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (float(tickers[sym]['last']), sym))
+                active_trades = cur.fetchall()
+                
+                # 1. مراقبة الأهداف (TP/SL) وتحديث الأسعار
+                for t in active_trades:
+                    sym = t['symbol']
+                    if sym in tickers:
+                        curr_p = float(tickers[sym]['last'])
+                        cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
+                        
+                        # حساب الربح/الخسارة للخروج
+                        pnl_pct = (curr_p - float(t['entry_price'])) / float(t['entry_price'])
+                        if pnl_pct >= TAKE_PROFIT_PCT:
+                            close_position(sym, curr_p, "🎯 جني أرباح سريع")
+                        elif pnl_pct <= -STOP_LOSS_PCT:
+                            close_position(sym, curr_p, "🛑 وقف خسارة حماية")
+                
+                # 2. البحث عن فرص جديدة (سكور 85+)
+                if len(active_trades) < MAX_TRADES:
+                    for sym, data in tickers.items():
+                        if '/USDT' in sym and sym not in [x['symbol'] for x in active_trades]:
+                            score = calculate_trade_score(data)
+                            if score >= ENTRY_SCORE_THRESHOLD:
+                                price = float(data['last'])
+                                cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time) VALUES (%s, %s, %s, %s, %s)",
+                                           (sym, price, price, INVESTMENT_PER_TRADE, datetime.now().strftime('%H:%M')))
+                                print(f"🔥 Auto-Entry: {sym} | Score: {score}")
+                                break # فتح صفقة واحدة فقط في كل دورة
+                
                 conn.commit(); cur.close(); conn.close()
             await asyncio.sleep(20)
-        except:
+        except Exception as e:
+            print(f"Engine Loop Error: {e}")
             await asyncio.sleep(20)
 
 if __name__ == "__main__":
-    # تشغيل نظام التنبيه الذاتي
     threading.Thread(target=keep_alive, daemon=True).start()
-    # تشغيل محرك التداول
     threading.Thread(target=lambda: asyncio.run(trading_engine()), daemon=True).start()
-    # تشغيل السيرفر
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
