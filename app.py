@@ -11,14 +11,14 @@ import time
 
 app = Flask(__name__)
 
-# --- الإعدادات ---
+# --- الإعدادات (حسب طلبك) ---
 INITIAL_CAPITAL = 1000.0
 INVESTMENT_PER_TRADE = 50.0
-ENTRY_SCORE_THRESHOLD = 60   
+ENTRY_SCORE_THRESHOLD = 60   # تقليل السكور إلى 60
 MAX_TRADES = 5
 STABLE_COINS = ['USDC/USDT', 'FDUSD/USDT', 'TUSD/USDT', 'PAXG/USDT', 'EUR/USDT', 'DAI/USDT']
 
-# لتخزين نتائج المسح لعرضها
+# لتخزين نتائج المسح لعرضها في الموقع
 last_scan_results = []
 
 DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP@dpg-d7cl24navr4c738vnis0-a.frankfurt-postgres.render.com/trading_bot_db_wv1h"
@@ -26,31 +26,36 @@ DB_URL = "postgresql://trading_bot_db_wv1h_user:IhfQrnLavCH3oULKVq5FeVngBqzL5eOP
 def get_db_connection():
     try: 
         return psycopg2.connect(str(DB_URL).strip(), sslmode='require', connect_timeout=15)
-    except: 
+    except Exception as e:
+        print(f"DB Connection Error: {e}")
         return None
 
 def calculate_trade_score(ticker):
     symbol = ticker.get('symbol', '')
     quote_vol = float(ticker.get('quoteVolume', 0) or 0)
     
+    # فلترة العملات المستقرة والعملات الضخمة (التي لا تتحرك بسرعة)
     if symbol in STABLE_COINS or quote_vol > 60000000: 
         return -1 
     
     score = 0
     try:
         change = float(ticker.get('percentage', 0) or 0)
+        # 1. قوة الصعود
         if change > 1.2: score += 30
         elif change > 0.5: score += 15
         
+        # 2. حجم التداول (مثالي للمضاربة)
         if 200000 < quote_vol < 20000000: score += 30
         
+        # 3. القرب من القمة اليومية (انفجار وشيك)
         last = float(ticker.get('last', 0) or 0)
         high = float(ticker.get('high', 0) or 0)
         if last >= (high * 0.96): score += 40 
     except: pass
     return score
 
-# --- الواجهة البرمجية ---
+# --- الواجهة الرسومية (Dashboard) ---
 @app.route('/')
 def index():
     conn = get_db_connection()
@@ -65,11 +70,11 @@ def index():
             cur.execute("SELECT balance FROM wallet WHERE id = 1")
             res_w = cur.fetchone()
             realized = float(res_w[0]) if res_w else 0.0
+            
             floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in active_trades)
             net_val = INITIAL_CAPITAL + realized + floating
             cur.close(); conn.close()
-        except: 
-            pass
+        except: pass
 
     return render_template_string("""
     <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
@@ -115,6 +120,7 @@ def index():
     </body></html>
     """, net=net_val, active=active_trades, scan=last_scan_results[:5])
 
+# --- محرك التداول (البحث والتنفيذ) ---
 async def trading_engine():
     global last_scan_results
     exchange = ccxt.gateio({'enableRateLimit': True})
@@ -128,27 +134,38 @@ async def trading_engine():
                 cur.execute("SELECT * FROM trades")
                 active_trades = cur.fetchall()
                 active_symbols = [x['symbol'] for x in active_trades]
+                
+                # 1. تحديث الأسعار اللحظية للصفقات المفتوحة
                 for t in active_trades:
                     if t['symbol'] in tickers:
                         new_p = float(tickers[t['symbol']]['last'])
                         cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (new_p, t['symbol']))
+                
+                # 2. مسح السوق للبحث عن فرص جديدة
                 for sym, data in tickers.items():
                     if '/USDT' in sym:
                         score = calculate_trade_score(data)
-                        if score > 30:
+                        if score > 30: # تخزين العملات القوية للمراقبة في الجدول
                             temp_scan.append({'sym': sym, 'sc': score, 'ch': data.get('percentage', 0), 'pr': data.get('last')})
+                        
+                        # تنفيذ الشراء إذا تحقق الشرط
                         if score >= ENTRY_SCORE_THRESHOLD and len(active_symbols) < MAX_TRADES and sym not in active_symbols:
                             p = float(data['last'])
                             cur.execute("INSERT INTO trades (symbol, entry_price, current_price, investment, open_time, entry_score) VALUES (%s, %s, %s, %s, %s, %s)",
                                        (sym, p, p, INVESTMENT_PER_TRADE, datetime.now().strftime('%H:%M'), score))
                             active_symbols.append(sym)
+                
                 last_scan_results = sorted(temp_scan, key=lambda x: x['sc'], reverse=True)
                 conn.commit(); cur.close(); conn.close()
-            await asyncio.sleep(15)
-        except: 
+            await asyncio.sleep(15) # المسح كل 15 ثانية
+        except Exception as e:
+            print(f"Engine Error: {e}")
             await asyncio.sleep(15)
 
 if __name__ == "__main__":
+    # تشغيل محرك التداول في خيط منفصل
     threading.Thread(target=lambda: asyncio.run(trading_engine()), daemon=True).start()
+    
+    # تشغيل Flask وتحديد المنفذ لـ Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
