@@ -59,9 +59,8 @@ def index():
         floating = sum(((float(t['current_price']) - float(t['entry_price'])) / float(t['entry_price'])) * float(t['investment']) for t in ot)
         net = INITIAL_CAPITAL + realized_pnl + floating
 
-        # السطر القادم هو بداية النص الثلاثي (Triple Quote)
         return render_template_string("""
-        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
         <style>
             body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; margin: 0; }
             .card { background: #1e2329; padding: 15px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #f0b90b; }
@@ -69,31 +68,49 @@ def index():
             .s-card { background: #1e2329; padding: 10px; border-radius: 8px; font-size: 12px; }
             .up { color: #0ecb81; } .down { color: #f6465d; }
             .btn-all { background: #f6465d; color: white; padding: 12px; border-radius: 8px; text-decoration: none; display: block; margin: 15px 0; font-weight: bold; border: 1px solid white; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; }
-            th, td { padding: 8px; border: 1px solid #2b3139; }
+            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
+            th, td { padding: 8px; border: 1px solid #2b3139; text-align: center; }
+            th { color: #848e9c; background: #2b3139; }
         </style></head><body>
             <div class="card">
-                <small>صافي القيمة الكلية</small><br>
+                <small style="color:#848e9c;">صافي قيمة المحفظة</small><br>
                 <b style="font-size:26px;" class="{{ 'up' if net_val >= 1000 else 'down' }}">${{ "%.2f"|format(net_val) }}</b>
             </div>
+            
             <div class="stats">
-                <div class="s-card">المستعملة<br><b style="color:#f0b90b;">${{ "%.2f"|format(inv) }}</b></div>
-                <div class="s-card">غير المستعملة<br><b style="color:#92a2b1;">${{ "%.2f"|format(un) }}</b></div>
+                <div class="s-card">السيولة المتاحة<br><b style="color:#92a2b1;">${{ "%.2f"|format(un) }}</b></div>
+                <div class="s-card">الربح العائم<br><b class="{{ 'up' if f_pnl >= 0 else 'down' }}">${{ "%.2f"|format(f_pnl) }}</b></div>
             </div>
+
             {% if trades_list|length > 0 %}
-            <a href="/close_all" class="btn-all" onclick="return confirm('إغلاق الكل؟')">⚠️ إغلاق كافة الصفقات</a>
+            <a href="/close_all" class="btn-all" onclick="return confirm('إغلاق الكل؟')">⚠️ تصفية جميع الصفقات</a>
             {% endif %}
-            <h4>📍 صفقات مفتوحة ({{ trades_list|length }})</h4>
+
+            <h4 style="text-align:right; margin: 10px 5px;">📍 الصفقات النشطة ({{ trades_list|length }})</h4>
             <table>
-                <tr><th>العملة</th><th>الحالي</th><th>الربح ($)</th></tr>
+                <tr>
+                    <th>العملة</th>
+                    <th>الدخول</th>
+                    <th>الحالي</th>
+                    <th>التغير (%)</th>
+                    <th>الربح ($)</th>
+                </tr>
                 {% for t in trades_list %}
-                {% set p = ((t.current_price - t.entry_price) / t.entry_price) * 50 %}
-                <tr><td>{{ t.symbol }}</td><td style="color:#f0b90b;">{{ t.current_price }}</td><td class="{{ 'up' if p >= 0 else 'down' }}">${{ "%.2f"|format(p) }}</td></tr>
+                {% set change_pct = ((t.current_price - t.entry_price) / t.entry_price) * 100 %}
+                {% set pnl_usd = (change_pct / 100) * 50 %}
+                <tr>
+                    <td><b>{{ t.symbol }}</b></td>
+                    <td>{{ t.entry_price }}</td>
+                    <td style="color:#f0b90b;">{{ t.current_price }}</td>
+                    <td class="{{ 'up' if change_pct >= 0 else 'down' }}">
+                        {{ "+" if change_pct > 0 }}{{ "%.2f"|format(change_pct) }}%
+                    </td>
+                    <td class="{{ 'up' if pnl_usd >= 0 else 'down' }}">${{ "%.2f"|format(pnl_usd) }}</td>
+                </tr>
                 {% endfor %}
             </table>
         </body></html>
-        """, inv=invested, un=unused, net_val=net, trades_list=ot)
-        # السطر أعلاه يغلق النص الثلاثي والقوس بشكل صحيح
+        """, inv=invested, un=unused, net_val=net, trades_list=ot, f_pnl=floating)
     except Exception as e:
         return f"Error: {str(e)}", 500
 
@@ -113,7 +130,7 @@ def close_all_route():
                 for t in trades:
                     s = str(t['symbol'])
                     if s in tickers:
-                        close_position(s, float(tickers[s]['last']), "👤 إغلاق كلي")
+                        close_position(s, float(tickers[s]['last']), "👤 تصفية كلية")
     except: pass
     return redirect(url_for('index'))
 
