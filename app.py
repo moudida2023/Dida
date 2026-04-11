@@ -15,7 +15,6 @@ exchange_status = "🔴"
 
 def get_db_connection():
     try:
-        # التأكد من أن الرابط نصي (String) وإضافة SSL
         url = str(DB_URL).strip()
         conn = psycopg2.connect(url, sslmode='require', connect_timeout=10)
         return conn
@@ -23,7 +22,6 @@ def get_db_connection():
         print(f"❌ DB connection failed: {e}")
         return None
 
-# --- وظيفة الإغلاق الموحدة مع معالجة الأخطاء ---
 def close_position(symbol, exit_price, reason):
     conn = get_db_connection()
     if conn is None: return False
@@ -43,10 +41,8 @@ def close_position(symbol, exit_price, reason):
         return True
     except Exception as e:
         print(f"❌ Close Error: {e}")
-        if conn: conn.rollback(); conn.close()
         return False
 
-# --- محرك التداول ---
 async def trading_engine():
     global exchange_status
     exchange = ccxt.gateio({'enableRateLimit': True})
@@ -57,12 +53,6 @@ async def trading_engine():
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor(cursor_factory=extras.DictCursor)
-                # التأكد من وجود الجداول
-                cur.execute("CREATE TABLE IF NOT EXISTS trades (symbol TEXT PRIMARY KEY, entry_price DOUBLE PRECISION, current_price DOUBLE PRECISION, tp_price DOUBLE PRECISION, sl_price DOUBLE PRECISION, investment DOUBLE PRECISION, open_time TEXT)")
-                cur.execute("CREATE TABLE IF NOT EXISTS closed_trades (id SERIAL PRIMARY KEY, symbol TEXT, entry_price DOUBLE PRECISION, exit_price DOUBLE PRECISION, pnl DOUBLE PRECISION, exit_reason TEXT, close_time TEXT)")
-                cur.execute("CREATE TABLE IF NOT EXISTS wallet (id INT PRIMARY KEY, balance DOUBLE PRECISION)")
-                cur.execute("INSERT INTO wallet (id, balance) VALUES (1, 0) ON CONFLICT DO NOTHING")
-                
                 cur.execute("SELECT * FROM trades")
                 active_trades = cur.fetchall()
                 tickers = await exchange.fetch_tickers()
@@ -76,18 +66,16 @@ async def trading_engine():
                         else: cur.execute("UPDATE trades SET current_price = %s WHERE symbol = %s", (curr_p, sym))
                 conn.commit()
                 cur.close(); conn.close()
-            await asyncio.sleep(20)
+            await asyncio.sleep(15)
         except Exception as e:
-            print(f"⚠️ Engine Error: {e}")
             exchange_status = "🔴"
             await asyncio.sleep(20)
 
-# --- الواجهة ---
+# --- واجهة الويب v500 ---
 @app.route('/')
 def index():
     conn = get_db_connection()
-    if conn is None:
-        return "<h3>⚠️ خطأ: تعذر الاتصال بقاعدة البيانات. تأكد من إعدادات Render.</h3>", 500
+    if conn is None: return "<h3>⚠️ فشل الاتصال بالقاعدة</h3>", 500
     
     try:
         cur = conn.cursor(cursor_factory=extras.DictCursor)
@@ -101,33 +89,57 @@ def index():
         cur.close(); conn.close()
         
         return render_template_string("""
-        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20">
+        <!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="15">
         <style>
-            body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 20px; }
-            .card { background: #1e2329; padding: 20px; border-radius: 10px; margin-bottom: 20px; border-bottom: 4px solid #f0b90b; }
+            body { background: #0b0e11; color: white; font-family: sans-serif; text-align: center; padding: 10px; }
+            .card { background: #1e2329; padding: 15px; border-radius: 10px; margin-bottom: 20px; border-bottom: 4px solid #f0b90b; }
             table { width: 100%; border-collapse: collapse; background: #1e2329; margin-top: 10px; }
-            th, td { padding: 10px; border: 1px solid #2b3139; font-size: 13px; }
+            th, td { padding: 8px; border: 1px solid #2b3139; font-size: 12px; }
+            th { background: #2b3139; color: #848e9c; }
             .up { color: #0ecb81; } .down { color: #f6465d; }
-            .btn { background: #f6465d; color: white; padding: 5px; border-radius: 4px; text-decoration: none; font-size: 11px; }
+            .btn { background: #f6465d; color: white; padding: 4px 8px; border-radius: 4px; text-decoration: none; }
         </style></head><body>
             <div class="card">
-                <h2>💰 المحفظة: ${{ "%.2f"|format(balance) }}</h2>
-                <p>البورصة: {{ s_ex }} | القاعدة: 🟢</p>
+                <h2 style="margin:5px;">💰 المحفظة: ${{ "%.2f"|format(balance) }}</h2>
+                <small>البورصة: {{ s_ex }} | القاعدة: 🟢</small>
             </div>
-            <h3>📍 صفقات مفتوحة</h3>
+
+            <h3>📍 الصفقات المفتوحة</h3>
             <table>
-                <tr><th>العملة</th><th>الحالي</th><th>النتيجة</th><th>تحكم</th></tr>
+                <tr>
+                    <th>العملة</th>
+                    <th>الدخول</th>
+                    <th>الحالي</th>
+                    <th style="color:#0ecb81;">جني الأرباح</th>
+                    <th style="color:#f6465d;">وقف الخسارة</th>
+                    <th>الربح ($)</th>
+                    <th>إجراء</th>
+                </tr>
                 {% for t in ot %}
                 {% set pnl = ((t.current_price - t.entry_price) / t.entry_price) * t.investment %}
-                <tr><td>{{ t.symbol }}</td><td style="color:#f0b90b;">{{ t.current_price }}</td><td class="{{ 'up' if pnl >= 0 else 'down' }}">${{ "%.2f"|format(pnl) }}</td>
-                <td><a href="/manual_close/{{ t.symbol }}" class="btn">إغلاق يدوي</a></td></tr>
+                <tr>
+                    <td><b>{{ t.symbol }}</b></td>
+                    <td>{{ t.entry_price }}</td>
+                    <td style="color:#f0b90b;">{{ t.current_price }}</td>
+                    <td class="up">{{ t.tp_price }}</td>
+                    <td class="down">{{ t.sl_price }}</td>
+                    <td class="{{ 'up' if pnl >= 0 else 'down' }}">${{ "%.2f"|format(pnl) }}</td>
+                    <td><a href="/manual_close/{{ t.symbol }}" class="btn">إغلاق</a></td>
+                </tr>
+                {% endfor %}
+            </table>
+
+            <h3>📜 السجل (آخر 10 صفقات)</h3>
+            <table>
+                <tr><th>العملة</th><th>النتيجة</th><th>السبب</th><th>التوقيت</th></tr>
+                {% for c in ct %}
+                <tr><td>{{ c.symbol }}</td><td class="{{ 'up' if c.pnl >= 0 else 'down' }}">${{ "%.2f"|format(c.pnl) }}</td><td>{{ c.exit_reason }}</td><td>{{ c.close_time }}</td></tr>
                 {% endfor %}
             </table>
         </body></html>
         """, s_ex=exchange_status, ot=ot, ct=ct, balance=balance)
     except Exception as e:
-        if conn: conn.close()
-        return f"<h3>⚠️ خطأ في معالجة البيانات: {e}</h3>", 500
+        return f"<h3>⚠️ خطأ في العرض: {e}</h3>", 500
 
 @app.route('/manual_close/<symbol>')
 def manual_close_route(symbol):
