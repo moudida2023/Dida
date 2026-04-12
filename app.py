@@ -4,115 +4,104 @@ import pandas as pd
 import requests
 import threading
 import os
-import time
+import gc
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# ======================== 1. الإعدادات المتقدمة ========================
-TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
-TELEGRAM_CHAT_ID = '5067771509'
+# ======================== 1. الإعدادات (تليجرام فقط) ========================
+TELEGRAM_TOKEN = 'YOUR_BOT_TOKEN'
+TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
 
+# الربط العام لجلب الأسعار فقط (بدون مفاتيح API)
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-VIRTUAL_BALANCE = 1000.0
-BASE_TRADE_USD = 100.0      # مبلغ الدخول الأول
-DCA_TRADE_USD = 50.0       # مبلغ التعزيز (DCA)
-PROFIT_TARGET_USD = 1.5     # الهدف الصافي بالدولار لكل صفقة
-DCA_THRESHOLD = -0.05       # تعزيز عند هبوط 5%
-
+# إعدادات المحفظة الافتراضية
+VIRTUAL_BALANCE = 1000.0  # رصيد وهمي للبداية
 portfolio = {"open_trades": {}}
+trade_history = {}
 closed_trades_history = []
-emergency_stop = False      # مفتاح الطوارئ
+current_market_mode = "NORMAL"
+daily_start_balance = 1000.0
 
-# ======================== 2. وحدة الأوامر المطورة ========================
+# ======================== 2. وحدة ذكاء السوق ========================
 
-def telegram_command_listener():
-    global emergency_stop
-    last_update_id = -1
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=30"
-            response = requests.get(url, timeout=35).json()
-            if response.get("result"):
-                for update in response["result"]:
-                    last_update_id = update["update_id"]
-                    if "message" in update and "text" in update["message"]:
-                        chat_id = str(update["message"]["chat"]["id"])
-                        text = update["message"]["text"].lower()
+async def get_market_regime():
+    global current_market_mode
+    try:
+        tickers = await EXCHANGE.fetch_tickers()
+        symbols = [s for s in tickers.keys() if '/USDT' in s]
+        top_50 = sorted(symbols, key=lambda x: tickers[x]['quoteVolume'], reverse=True)[:50]
+        up_count = sum(1 for sym in top_50 if tickers[sym]['percentage'] > 0.5)
+        
+        if up_count <= 10:
+            current_market_mode = "PROTECT"
+            return {"mode": "PROTECT", "max_trades": 3, "vol_mult": 6.0, "mfi_limit": 70, "count": 50}
+        elif up_count >= 35:
+            current_market_mode = "ULTRA_BULL"
+            return {"mode": "ULTRA_BULL", "max_trades": 20, "vol_mult": 1.8, "mfi_limit": 40, "count": 400}
+        else:
+            current_market_mode = "NORMAL"
+            return {"mode": "NORMAL", "max_trades": 10, "vol_mult": 3.0, "mfi_limit": 50, "count": 250}
+    except:
+        return {"mode": "NORMAL", "max_trades": 10, "vol_mult": 3.0, "mfi_limit": 50, "count": 250}
 
-                        if chat_id == TELEGRAM_CHAT_ID:
-                            if text == "/start":
-                                send_telegram_msg("🚀 *نظام Snowball v13.0 PRO*\nالوضع: نشط\nنظام التعزيز (DCA): مفعل")
-                            elif text == "/panic":
-                                emergency_stop = True
-                                send_telegram_msg("⚠️ *تم تفعيل وضع الطوارئ!* لن يتم فتح صفقات جديدة.")
-                            elif text == "/resume":
-                                emergency_stop = False
-                                send_telegram_msg("✅ *تم استئناف العمل بنجاح.*")
-                            elif text in ["/report", "تقرير"]:
-                                send_telegram_msg(generate_report_text())
-        except: time.sleep(5)
-        time.sleep(1)
-
-def generate_report_text():
-    total_pnl = sum(t['pnl'] for t in closed_trades_history)
-    return (f"📊 *تقرير الأداء:*\n"
-            f"💰 الرصيد: `${VIRTUAL_BALANCE:.2f}`\n"
-            f"✅ صفقات منتهية: {len(closed_trades_history)}\n"
-            f"📈 أرباح: `${total_pnl:.2f}`\n"
-            f"📂 صفقات معلقة: {len(portfolio['open_trades'])}")
-
-# ======================== 3. منطق الفحص مع فلتر الاتجاه ========================
+# ======================== 3. مسح السوق والدخول الافتراضي ========================
 
 async def scan_market():
-    global VIRTUAL_BALANCE, emergency_stop
-    if emergency_stop or len(portfolio["open_trades"]) >= 10 or VIRTUAL_BALANCE < BASE_TRADE_USD: return
-
-    BLACKLIST = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'USDC/USDT', 'FDUSD/USDT']
+    global VIRTUAL_BALANCE
+    regime = await get_market_regime()
+    if len(portfolio["open_trades"]) >= regime['max_trades']: return
+    
+    # حساب قيمة الصفقة (5% من الرصيد الوهمي)
+    trade_amount = max(20, min(VIRTUAL_BALANCE * 0.05, 300))
+    
+    # التأكد من توفر رصيد وهمي كافٍ
+    if VIRTUAL_BALANCE < trade_amount: return
 
     try:
-        # فحص حالة البيتكوين كفلتر للسوق
-        btc_ticker = await EXCHANGE.fetch_ticker('BTC/USDT')
-        if btc_ticker['percentage'] < -3.0: # إذا البيتكوين يهبط بقوة، نتوقف
-            return
-
         tickers = await EXCHANGE.fetch_tickers()
-        symbols = [s for s in tickers.keys() if '/USDT' in s and s not in BLACKLIST and tickers[s]['quoteVolume'] > 1500000]
-        top_symbols = sorted(symbols, key=lambda x: tickers[x]['quoteVolume'], reverse=True)[:40]
+        symbols = [s for s in tickers.keys() if '/USDT' in s and tickers[s]['quoteVolume'] > 1200000]
+        top_symbols = sorted(symbols, key=lambda x: tickers[x]['quoteVolume'], reverse=True)[10:10+regime['count']]
         
         for sym in top_symbols:
             if sym in portfolio["open_trades"]: continue
+            if sym in trade_history and (datetime.now() - trade_history[sym]).total_seconds() < 14400: continue
             
-            bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=50)
-            df = pd.DataFrame(bars, columns=['ts','open','high','low','close','vol'])
-            
-            # حساب سكور 5/5
-            ema9 = df['close'].ewm(span=9, adjust=False).mean().iloc[-1]
+            bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=100)
+            df = calculate_indicators(pd.DataFrame(bars, columns=['ts','open','high','low','close','vol']))
             last = df.iloc[-1]
             
-            score = 0
-            if last['close'] > ema9: score += 1
-            if last['close'] > last['open']: score += 1
-            if last['vol'] > df['vol'].tail(10).mean(): score += 1
-            if last['close'] > df.iloc[-2]['high']: score += 1
-            if last['close'] > df['close'].shift(1).iloc[-1]: score += 1
+            # فلاتر الدخول
+            upper_shadow = last['high'] - max(last['open'], last['close'])
+            if upper_shadow > (abs(last['close'] - last['open']) * 0.8): continue
+            if last['close'] <= last['ema9'] or last['rsi'] <= 50 or last['mfi'] < regime['mfi_limit']: continue
+            
+            # تنفيذ "شراء" وهمي
+            entry_price = last['close']
+            entry_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            portfolio["open_trades"][sym] = {
+                "entry_price": entry_price, 
+                "highest_p": entry_price, 
+                "amount": trade_amount, 
+                "time": entry_time
+            }
+            VIRTUAL_BALANCE -= trade_amount # خصم من الرصيد الوهمي
+            trade_history[sym] = datetime.now()
 
-            if score == 5:
-                # شراء أولي
-                entry_price = last['close']
-                portfolio["open_trades"][sym] = {
-                    "entry_price": entry_price,
-                    "avg_price": entry_price,
-                    "coins": BASE_TRADE_USD / entry_price,
-                    "amount_usd": BASE_TRADE_USD,
-                    "dca_count": 0
-                }
-                VIRTUAL_BALANCE -= BASE_TRADE_USD
-                send_telegram_msg(f"🚀 *دخول ذكي*\n🎫 {sym}\n💵 السعر: {entry_price:.6f}")
-                break 
+            msg = (
+                f"🧪 *دخول افتراضي (Paper)*\n"
+                f"🎫 {sym} | ${trade_amount:.1f}\n"
+                f"💰 السعر: {entry_price:.6f}\n"
+                f"⏰ الوقت: {entry_time}"
+            )
+            send_telegram_msg(msg)
+            
+            if len(portfolio["open_trades"]) >= regime['max_trades']: break
+            await asyncio.sleep(0.1)
     except: pass
 
-# ======================== 4. إدارة الصفقات + نظام التعزيز DCA ========================
+# ======================== 4. إدارة الصفقات والخروج الوهمي ========================
 
 async def manage_trades():
     global VIRTUAL_BALANCE
@@ -122,33 +111,78 @@ async def manage_trades():
                 trade = portfolio["open_trades"][sym]
                 ticker = await EXCHANGE.fetch_ticker(sym)
                 cp = ticker['last']
+                profit = (cp - trade['entry_price']) / trade['entry_price']
                 
-                # حساب الربح بناءً على متوسط السعر
-                profit_usd = (trade['coins'] * cp) - trade['amount_usd']
-                profit_pct = (cp - trade['avg_price']) / trade['avg_price']
-                
-                # 1. الخروج عند الربح
-                if profit_usd >= PROFIT_TARGET_USD:
-                    VIRTUAL_BALANCE += (trade['amount_usd'] + profit_usd)
-                    closed_trades_history.append({"pnl": profit_usd})
-                    portfolio["open_trades"].pop(sym)
-                    send_telegram_msg(f"🎯 *هدف محقق (+1.5$)*\n🎫 {sym}\n💰 الربح الكلي: {profit_usd:.2f}")
+                entry_dt = datetime.strptime(trade['time'], '%Y-%m-%d %H:%M:%S')
+                hours_passed = (datetime.now() - entry_dt).total_seconds() / 3600
 
-                # 2. نظام التعزيز (DCA) عند الهبوط
-                elif profit_pct <= DCA_THRESHOLD and trade['dca_count'] < 1: # تعزيز لمرة واحدة
-                    if VIRTUAL_BALANCE >= DCA_TRADE_USD:
-                        new_coins = DCA_TRADE_USD / cp
-                        trade['coins'] += new_coins
-                        trade['amount_usd'] += DCA_TRADE_USD
-                        trade['avg_price'] = trade['amount_usd'] / trade['coins'] # تحديث متوسط السعر
-                        trade['dca_count'] += 1
-                        VIRTUAL_BALANCE -= DCA_TRADE_USD
-                        send_telegram_msg(f"🛠 *تعزيز (DCA)*\n🎫 {sym}\n📉 السعر الجديد: {trade['avg_price']:.6f}")
+                # شروط الخروج
+                reason = None
+                if hours_passed >= 24 and profit < 0.03: reason = "⏰ الزمن (24س)"
+                elif current_market_mode == "ULTRA_BULL":
+                    portfolio["open_trades"][sym]["highest_p"] = max(trade.get("highest_p", 0), cp)
+                    hp = portfolio["open_trades"][sym]["highest_p"]
+                    if profit >= 0.03 and ((hp - cp) / hp) >= 0.01: reason = "📈 تتبع الربح"
+                elif profit >= 0.03: reason = "🎯 هدف 3%"
+                elif profit <= -0.02: reason = "🛑 وقف خسارة -2%"
 
-            await asyncio.sleep(15)
+                if reason:
+                    # إعادة المبلغ + الربح/الخسارة للرصيد الوهمي
+                    final_amount = trade['amount'] * (1 + profit)
+                    VIRTUAL_BALANCE += final_amount
+                    
+                    profit_pct = profit * 100
+                    closed_trades_history.append({"sym": sym, "profit": profit_pct, "exit_time": datetime.now()})
+                    portfolio["open_trades"].pop(sym, None)
+                    
+                    msg = (
+                        f"🏁 *إغلاق افتراضي*\n"
+                        f"🎫 {sym} | {profit_pct:+.2f}%\n"
+                        f"📝 السبب: {reason}\n"
+                        f"💰 الرصيد الوهمي الحالي: ${VIRTUAL_BALANCE:.2f}"
+                    )
+                    send_telegram_msg(msg)
+
+            await asyncio.sleep(20)
         except: await asyncio.sleep(5)
 
-# ======================== 5. تشغيل النظام ========================
+# ======================== 5. التقارير الدورية (وهمي) ========================
+
+async def periodic_reports():
+    global daily_start_balance
+    last_4h = datetime.now()
+    last_24h = datetime.now()
+    
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now()
+        
+        if now - last_4h >= timedelta(hours=4):
+            report = f"🕒 *تقرير 4س (افتراضي)*\n📂 مفتوح: {len(portfolio['open_trades'])}\n💰 الرصيد المتوفر: ${VIRTUAL_BALANCE:.2f}"
+            send_telegram_msg(report)
+            last_4h = now
+
+        if now - last_24h >= timedelta(hours=24):
+            growth = ((VIRTUAL_BALANCE - daily_start_balance) / daily_start_balance * 100)
+            report = f"📅 *تقرير يومي (افتراضي)*\n💰 الرصيد: ${VIRTUAL_BALANCE:.2f}\n🚀 النمو: {growth:+.2f}%"
+            send_telegram_msg(report)
+            daily_start_balance = VIRTUAL_BALANCE
+            last_24h = now
+
+# ======================== 6. الدوال المساعدة والتشغيل ========================
+
+def calculate_indicators(df):
+    close = df['close']
+    df['ema9'] = close.ewm(span=9, adjust=False).mean()
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    df['rsi'] = 100 - (100 / (1 + (gain / loss)))
+    tp = (df['high'] + df['low'] + close) / 3
+    mf = tp * df['vol']
+    df['mfi'] = 100 - (100 / (1 + (mf.where(close > close.shift(1), 0).rolling(14).sum() / 
+                                  mf.where(close < close.shift(1), 0).rolling(14).sum())))
+    return df
 
 def send_telegram_msg(msg):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
@@ -156,17 +190,18 @@ def send_telegram_msg(msg):
 
 app = Flask('')
 @app.route('/')
-def home(): return f"Snowball PRO v13.0 - Balance: {VIRTUAL_BALANCE:.2f}"
+def home(): return f"Snowball Virtual: {VIRTUAL_BALANCE:.2f} USDT"
 
 async def main_loop():
-    send_telegram_msg("✅ *البوت المطور v13.0 يعمل الآن بنظام DCA وفلترة BTC*")
+    send_telegram_msg("🧪 *Snowball V11.5 Virtual* بدأ بنجاح.\nالرصيد الافتراضي: 1000 USDT.")
     asyncio.create_task(manage_trades())
-    threading.Thread(target=telegram_command_listener, daemon=True).start()
+    asyncio.create_task(periodic_reports())
     while True:
-        await scan_market()
-        await asyncio.sleep(45)
+        try:
+            await scan_market()
+            await asyncio.sleep(60)
+        except: await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
     asyncio.run(main_loop())
