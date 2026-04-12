@@ -9,8 +9,8 @@ from flask import Flask
 from datetime import datetime, timedelta
 
 # ======================== 1. الإعدادات (تليجرام فقط) ========================
-TELEGRAM_TOKEN = 'YOUR_BOT_TOKEN'
-TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
+TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
+TELEGRAM_CHAT_ID = '5067771509
 
 # الربط العام لجلب الأسعار فقط (بدون مفاتيح API)
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
