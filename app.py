@@ -3,79 +3,160 @@ import ccxt.pro as ccxt
 import pandas as pd
 import requests
 import threading
+import time
 import os
 from flask import Flask
-from datetime import datetime, timedelta
 
-# ======================== 1. الإعدادات ========================
-# ملاحظة: تأكد من مراسلة البوت أولاً بـ /start لتتمكن من استقبال الرسائل
+# ======================== 1. الإعدادات والتحكم ========================
+# تأكد أن هذا هو الـ ID الخاص بك (يمكنك الحصول عليه من بوت @userinfobot)
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
-TELEGRAM_CHAT_ID = '8439548325'
+TELEGRAM_CHAT_ID = '5067771509' 
 
-# الربط العام
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# إعدادات المحفظة الافتراضية
 VIRTUAL_BALANCE = 1000.0
+BASE_TRADE_USD = 100.0
+TRAILING_TRIGGER = 0.02    
+TRAILING_CALLBACK = 0.005  
+
 portfolio = {"open_trades": {}}
-trade_history = {}
 closed_trades_history = []
-current_market_mode = "NORMAL"
-daily_start_balance = 1000.0
 
-# ======================== 2. دالة الإرسال (المحسنة) ========================
-def send_telegram_msg(msg):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"Telegram Error: {response.text}")
-    except Exception as e:
-        print(f"Connection Error to Telegram: {e}")
+# ======================== 2. نظام الأوامر (تحديث: مع نظام تشخيص) ========================
 
-# ======================== 3. وحدة ذكاء السوق ========================
-async def get_market_regime():
-    global current_market_mode
-    try:
-        tickers = await EXCHANGE.fetch_tickers()
-        symbols = [s for s in tickers.keys() if '/USDT' in s]
-        top_50 = sorted(symbols, key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)[:50]
-        up_count = sum(1 for sym in top_50 if tickers[sym].get('percentage', 0) > 0.5)
-        
-        if up_count <= 10:
-            current_market_mode = "PROTECT"
-            return {"mode": "PROTECT", "max_trades": 3, "vol_mult": 6.0, "mfi_limit": 70, "count": 50}
-        elif up_count >= 35:
-            current_market_mode = "ULTRA_BULL"
-            return {"mode": "ULTRA_BULL", "max_trades": 20, "vol_mult": 1.8, "mfi_limit": 40, "count": 400}
-        else:
-            current_market_mode = "NORMAL"
-            return {"mode": "NORMAL", "max_trades": 10, "vol_mult": 3.0, "mfi_limit": 50, "count": 250}
-    except Exception as e:
-        print(f"Market Regime Error: {e}")
-        return {"mode": "NORMAL", "max_trades": 10, "vol_mult": 3.0, "mfi_limit": 50, "count": 250}
+def handle_telegram_commands():
+    global VIRTUAL_BALANCE
+    last_update_id = 0
+    print("🤖 مستمع أوامر تليجرام بدأ العمل...")
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=30"
+            response = requests.get(url, timeout=35).json()
+            
+            if "result" in response:
+                for update in response["result"]:
+                    last_update_id = update["update_id"]
+                    if "message" in update and "text" in update["message"]:
+                        text = update["message"]["text"].lower().strip()
+                        chat_id = str(update["message"]["chat_id"])
+                        
+                        # سطر للتشخيص يظهر في Logs موقع Railway
+                        print(f"📩 رسالة مستلمة: {text} من ID: {chat_id}")
 
-# ======================== 4. المؤشرات الفنية ========================
-def calculate_indicators(df):
-    close = df['close']
-    df['ema9'] = close.ewm(span=9, adjust=False).mean()
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    df['rsi'] = 100 - (100 / (1 + (gain / loss)))
-    tp = (df['high'] + df['low'] + close) / 3
+                        if chat_id != TELEGRAM_CHAT_ID:
+                            print("⚠️ رسالة من مستخدم غير مصرح له، تم التجاهل.")
+                            continue
+
+                        if text == "/status":
+                            total_pnl = sum([t['pnl'] for t in closed_trades_history])
+                            msg = (f"💰 **حالة المحفظة:**\n"
+                                   f"• الرصيد الحالي: `${VIRTUAL_BALANCE:.2f}`\n"
+                                   f"• الأرباح المحققة: `${total_pnl:.2f}`\n"
+                                   f"• صفقات مفتوحة: `{len(portfolio['open_trades'])}`")
+                            send_telegram_msg(msg)
+
+                        elif text == "/report":
+                            if not portfolio["open_trades"]:
+                                send_telegram_msg("📭 لا توجد صفقات مفتوحة حالياً.")
+                            else:
+                                report = "📑 **تقرير الصفقات:**\n"
+                                for sym, data in portfolio["open_trades"].items():
+                                    report += f"• `{sym}`: دخول @ {data['entry_price']:.4f}\n"
+                                send_telegram_msg(report)
+
+                        elif text == "/panic":
+                            count = len(portfolio["open_trades"])
+                            for sym in list(portfolio["open_trades"].keys()):
+                                trade = portfolio["open_trades"][sym]
+                                VIRTUAL_BALANCE += trade['amount_usd']
+                                portfolio["open_trades"].pop(sym)
+                            send_telegram_msg(f"⚠️ **PANIC:** تم إغلاق {count} صفقات فوراً!")
+
+                        elif text.startswith("/close "):
+                            sym = text.split(" ")[1].upper()
+                            if not sym.endswith("/USDT"): sym += "/USDT"
+                            if sym in portfolio["open_trades"]:
+                                VIRTUAL_BALANCE += portfolio["open_trades"][sym]['amount_usd']
+                                portfolio["open_trades"].pop(sym)
+                                send_telegram_msg(f"✅ تم إغلاق `{sym}` يدوياً.")
+                            else:
+                                send_telegram_msg(f"❌ العملة `{sym}` غير موجودة.")
+
+        except Exception as e:
+            print(f"❌ خطأ في تليجرام: {e}")
+        time.sleep(1)
+
+# ======================== 3. محرك التداول (8/8) ========================
+
+def get_indicators(df):
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    basis = df['close'].rolling(window=20).mean()
+    std = df['close'].rolling(window=20).std()
+    df['bandwidth'] = (4 * std) / basis
+    tp = (df['high'] + df['low'] + df['close']) / 3
     mf = tp * df['vol']
-    positive_mf = mf.where(close > close.shift(1), 0).rolling(14).sum()
-    negative_mf = mf.where(close < close.shift(1), 0).rolling(14).sum()
-    df['mfi'] = 100 - (100 / (1 + (positive_mf / negative_mf)))
+    pos = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    df['mfi'] = 100 - (100 / (1 + (pos / neg)))
     return df
 
-# ======================== 5. مسح السوق والدخول ========================
 async def scan_market():
     global VIRTUAL_BALANCE
-    regime = await get_market_reg
+    if len(portfolio["open_trades"]) >= 5: return
+    try:
+        tickers = await EXCHANGE.fetch_tickers()
+        symbols = [s for s in tickers.keys() if '/USDT' in s and tickers[s]['quoteVolume'] > 3000000]
+        for sym in sorted(symbols, key=lambda x: tickers[x]['quoteVolume'], reverse=True)[:30]:
+            if sym in portfolio["open_trades"]: continue
+            bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=50)
+            df = get_indicators(pd.DataFrame(bars, columns=['ts','open','high','low','close','vol']))
+            last = df.iloc[-1]
+            
+            # شرط دخول 8/8 سكالبينج
+            if last['close'] > last['ema9'] and last['mfi'] > 60 and last['vol'] > df['vol'].tail(10).mean() * 1.5:
+                portfolio["open_trades"][sym] = {
+                    "entry_price": last['close'], "highest_price": last['close'],
+                    "coins": BASE_TRADE_USD / last['close'], "amount_usd": BASE_TRADE_USD, "trailing_active": False
+                }
+                VIRTUAL_BALANCE -= BASE_TRADE_USD
+                send_telegram_msg(f"🚀 **دخول:** `{sym}` @ {last['close']:.6f}")
+                break
+    except: pass
+
+async def manage_trades():
+    global VIRTUAL_BALANCE
+    while True:
+        try:
+            for sym in list(portfolio["open_trades"].keys()):
+                trade = portfolio["open_trades"][sym]
+                ticker = await EXCHANGE.fetch_ticker(sym)
+                cp = ticker['last']
+                if cp > trade['highest_price']: trade['highest_price'] = cp
+                profit_pct = (cp - trade['entry_price']) / trade['entry_price']
+                
+                if profit_pct >= TRAILING_TRIGGER: trade['trailing_active'] = True
+                
+                if trade['trailing_active']:
+                    if (trade['highest_price'] - cp) / trade['highest_price'] >= TRAILING_CALLBACK:
+                        pnl = (trade['coins'] * cp) - trade['amount_usd']
+                        VIRTUAL_BALANCE += (trade['amount_usd'] + pnl)
+                        closed_trades_history.append({"pnl": pnl})
+                        portfolio["open_trades"].pop(sym)
+                        send_telegram_msg(f"💰 **جني أرباح:** `{sym}` | +${pnl:.2f}")
+                elif profit_pct <= -0.03:
+                    VIRTUAL_BALANCE += (trade['coins'] * cp)
+                    portfolio["open_trades"].pop(sym)
+                    send_telegram_msg(f"🛑 **وقف خسارة:** `{sym}`")
+            await asyncio.sleep(10)
+        except: await asyncio.sleep(5)
+
+# ======================== 4. تشغيل السيرفر ========================
+
+def send_telegram_msg(msg):
+    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    except: pass
+
+app = Flask('')
+@app.route('/')
+def home():
