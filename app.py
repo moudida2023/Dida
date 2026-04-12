@@ -6,16 +6,16 @@ import threading
 import os
 from flask import Flask
 from datetime import datetime, timedelta
+from waitress import serve  # تم إضافة هذا السيرفر لإزالة التنبيه الأحمر
 
 # ======================== 1. الإعدادات ========================
-# ملاحظة: تأكد من مراسلة البوت أولاً بـ /start لتتمكن من استقبال الرسائل
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 
-# الربط العام
+# الربط العام (بينانس)
 EXCHANGE = ccxt.binance({'enableRateLimit': True})
 
-# إعدادات المحفظة الافتراضية
+# إعدادات المحفظة الافتراضية (Paper Trading)
 VIRTUAL_BALANCE = 1000.0
 portfolio = {"open_trades": {}}
 trade_history = {}
@@ -23,7 +23,7 @@ closed_trades_history = []
 current_market_mode = "NORMAL"
 daily_start_balance = 1000.0
 
-# ======================== 2. دالة الإرسال (المحسنة) ========================
+# ======================== 2. دالة الإرسال ========================
 def send_telegram_msg(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -70,9 +70,9 @@ def calculate_indicators(df):
     df['rsi'] = 100 - (100 / (1 + (gain / loss)))
     tp = (df['high'] + df['low'] + close) / 3
     mf = tp * df['vol']
-    positive_mf = mf.where(close > close.shift(1), 0).rolling(14).sum()
-    negative_mf = mf.where(close < close.shift(1), 0).rolling(14).sum()
-    df['mfi'] = 100 - (100 / (1 + (positive_mf / negative_mf)))
+    pos_mf = mf.where(close > close.shift(1), 0).rolling(14).sum()
+    neg_mf = mf.where(close < close.shift(1), 0).rolling(14).sum()
+    df['mfi'] = 100 - (100 / (1 + (pos_mf / neg_mf)))
     return df
 
 # ======================== 5. مسح السوق والدخول ========================
@@ -81,138 +81,4 @@ async def scan_market():
     regime = await get_market_regime()
     if len(portfolio["open_trades"]) >= regime['max_trades']: return
     
-    trade_amount = max(20, min(VIRTUAL_BALANCE * 0.05, 300))
-    if VIRTUAL_BALANCE < trade_amount: return
-
-    try:
-        tickers = await EXCHANGE.fetch_tickers()
-        symbols = [s for s in tickers.keys() if '/USDT' in s and (tickers[s].get('quoteVolume') or 0) > 1200000]
-        top_symbols = sorted(symbols, key=lambda x: tickers[x]['quoteVolume'], reverse=True)[10:10+regime['count']]
-        
-        for sym in top_symbols:
-            if sym in portfolio["open_trades"]: continue
-            if sym in trade_history and (datetime.now() - trade_history[sym]).total_seconds() < 14400: continue
-            
-            bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=100)
-            df = calculate_indicators(pd.DataFrame(bars, columns=['ts','open','high','low','close','vol']))
-            last = df.iloc[-1]
-            
-            upper_shadow = last['high'] - max(last['open'], last['close'])
-            if upper_shadow > (abs(last['close'] - last['open']) * 0.8): continue
-            if last['close'] <= last['ema9'] or last['rsi'] <= 50 or last['mfi'] < regime['mfi_limit']: continue
-            
-            entry_price = last['close']
-            entry_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            portfolio["open_trades"][sym] = {
-                "entry_price": entry_price, 
-                "highest_p": entry_price, 
-                "amount": trade_amount, 
-                "time": entry_time
-            }
-            VIRTUAL_BALANCE -= trade_amount
-            trade_history[sym] = datetime.now()
-
-            msg = (
-                f"🧪 *دخول افتراضي (Paper)*\n"
-                f"🎫 {sym} | ${trade_amount:.1f}\n"
-                f"💰 السعر: {entry_price:.6f}\n"
-                f"⏰ الوقت: {entry_time}"
-            )
-            send_telegram_msg(msg)
-            
-            if len(portfolio["open_trades"]) >= regime['max_trades']: break
-            await asyncio.sleep(0.1)
-    except Exception as e:
-        print(f"Scan Error: {e}")
-
-# ======================== 6. إدارة الصفقات ========================
-async def manage_trades():
-    global VIRTUAL_BALANCE
-    while True:
-        try:
-            for sym in list(portfolio["open_trades"].keys()):
-                trade = portfolio["open_trades"][sym]
-                ticker = await EXCHANGE.fetch_ticker(sym)
-                cp = ticker['last']
-                profit = (cp - trade['entry_price']) / trade['entry_price']
-                
-                entry_dt = datetime.strptime(trade['time'], '%Y-%m-%d %H:%M:%S')
-                hours_passed = (datetime.now() - entry_dt).total_seconds() / 3600
-
-                reason = None
-                if hours_passed >= 24 and profit < 0.03: reason = "⏰ الزمن (24س)"
-                elif current_market_mode == "ULTRA_BULL":
-                    portfolio["open_trades"][sym]["highest_p"] = max(trade.get("highest_p", 0), cp)
-                    hp = portfolio["open_trades"][sym]["highest_p"]
-                    if profit >= 0.03 and ((hp - cp) / hp) >= 0.01: reason = "📈 تتبع الربح"
-                elif profit >= 0.03: reason = "🎯 هدف 3%"
-                elif profit <= -0.02: reason = "🛑 وقف خسارة -2%"
-
-                if reason:
-                    final_amount = trade['amount'] * (1 + profit)
-                    VIRTUAL_BALANCE += final_amount
-                    profit_pct = profit * 100
-                    closed_trades_history.append({"sym": sym, "profit": profit_pct, "exit_time": datetime.now()})
-                    portfolio["open_trades"].pop(sym, None)
-                    
-                    msg = (
-                        f"🏁 *إغلاق افتراضي*\n"
-                        f"🎫 {sym} | {profit_pct:+.2f}%\n"
-                        f"📝 السبب: {reason}\n"
-                        f"💰 الرصيد الوهمي: ${VIRTUAL_BALANCE:.2f}"
-                    )
-                    send_telegram_msg(msg)
-
-            await asyncio.sleep(20)
-        except Exception as e:
-            print(f"Manage Trades Error: {e}")
-            await asyncio.sleep(5)
-
-# ======================== 7. التقارير الدورية ========================
-async def periodic_reports():
-    global daily_start_balance
-    last_4h = datetime.now()
-    last_24h = datetime.now()
-    
-    while True:
-        await asyncio.sleep(60)
-        now = datetime.now()
-        
-        if now - last_4h >= timedelta(hours=4):
-            report = f"🕒 *تقرير 4س (افتراضي)*\n📂 مفتوح: {len(portfolio['open_trades'])}\n💰 الرصيد: ${VIRTUAL_BALANCE:.2f}"
-            send_telegram_msg(report)
-            last_4h = now
-
-        if now - last_24h >= timedelta(hours=24):
-            growth = ((VIRTUAL_BALANCE - daily_start_balance) / daily_start_balance * 100)
-            report = f"📅 *تقرير يومي (افتراضي)*\n💰 الرصيد: ${VIRTUAL_BALANCE:.2f}\n🚀 النمو: {growth:+.2f}%"
-            send_telegram_msg(report)
-            daily_start_balance = VIRTUAL_BALANCE
-            last_24h = now
-
-# ======================== 8. التشغيل ========================
-app = Flask('')
-@app.route('/')
-def home(): return f"Snowball Virtual Running: {VIRTUAL_BALANCE:.2f} USDT"
-
-async def main_loop():
-    send_telegram_msg("🧪 *Snowball V11.5 Virtual* بدأ بنجاح.\nالرصيد الافتراضي: 1000 USDT.")
-    asyncio.create_task(manage_trades())
-    asyncio.create_task(periodic_reports())
-    while True:
-        try:
-            await scan_market()
-            await asyncio.sleep(60)
-        except Exception as e:
-            print(f"Main Loop Error: {e}")
-            await asyncio.sleep(30)
-
-if __name__ == "__main__":
-    # تشغيل Flask في ثريد منفصل
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000))), daemon=True).start()
-    # تشغيل البوت
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        pass
+    trade_amt = max(20, min(VIRTUAL_BALANCE * 0.05, 300
