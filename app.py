@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 # ======================== 1. الإعدادات ========================
 # ملاحظة: تأكد من مراسلة البوت أولاً بـ /start لتتمكن من استقبال الرسائل
-TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
+TELEGRAM_TOKEN = '8603477836:AAGG6Outg3Z9vBI-NjWQ3ALJroh_Cye3l2c'
 TELEGRAM_CHAT_ID = '5067771509'
 
 # الربط العام
