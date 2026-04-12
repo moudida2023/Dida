@@ -3,6 +3,7 @@ import ccxt.pro as ccxt
 import pandas as pd
 import requests
 import threading
+import time
 from flask import Flask
 
 # ======================== 1. الإعدادات والتحكم ========================
@@ -31,7 +32,7 @@ def handle_telegram_commands():
                 for update in response["result"]:
                     last_update_id = update["update_id"]
                     if "message" in update and "text" in update["message"]:
-                        text = update["message"]["text"].lower()
+                        text = update["message"]["text"].lower().strip()
                         chat_id = str(update["message"]["chat_id"])
                         
                         if chat_id != TELEGRAM_CHAT_ID: continue
@@ -43,46 +44,55 @@ def handle_telegram_commands():
                             else:
                                 report = "📑 **تقرير الصفقات المفتوحة:**\n"
                                 for sym, data in portfolio["open_trades"].items():
-                                    report += f"• `{sym}`: دخول {data['entry_price']:.4f}\n"
+                                    current_pnl = (data['highest_price'] - data['entry_price']) / data['entry_price'] * 100
+                                    report += f"• `{sym}`: دخول {data['entry_price']:.4f} (أعلى ربح: {current_pnl:.2f}%)\n"
                                 send_telegram_msg(report)
 
                         # 2. أمر الحالة /status
                         elif text == "/status":
                             total_pnl = sum([t['pnl'] for t in closed_trades_history])
                             status = (f"💰 **حالة المحفظة:**\n"
-                                      f"• الرصيد الحالي: ${VIRTUAL_BALANCE:.2f}\n"
-                                      f"• إجمالي الأرباح المحققة: ${total_pnl:.2f}\n"
-                                      f"• صفقات مفتوحة: {len(portfolio['open_trades'])}")
+                                      f"• الرصيد الحالي: `${VIRTUAL_BALANCE:.2f}`\n"
+                                      f"• إجمالي الأرباح المحققة: `${total_pnl:.2f}`\n"
+                                      f"• صفقات مفتوحة: `{len(portfolio['open_trades'])}`")
                             send_telegram_msg(status)
 
                         # 3. أمر الطوارئ /panic
                         elif text == "/panic":
                             global VIRTUAL_BALANCE
-                            for sym in list(portfolio["open_trades"].keys()):
-                                trade = portfolio["open_trades"][sym]
-                                # في الحقيقي سننفذ أمر بيع ماركت، هنا سنغلق افتراضياً
-                                VIRTUAL_BALANCE += trade['amount_usd'] 
-                                portfolio["open_trades"].pop(sym)
-                            send_telegram_msg("⚠️ **PANIC:** تم إغلاق جميع الصفقات فوراً!")
+                            if not portfolio["open_trades"]:
+                                send_telegram_msg("🤷 لا توجد صفقات لإغلاقها.")
+                            else:
+                                count = len(portfolio["open_trades"])
+                                for sym in list(portfolio["open_trades"].keys()):
+                                    trade = portfolio["open_trades"][sym]
+                                    VIRTUAL_BALANCE += trade['amount_usd'] 
+                                    portfolio["open_trades"].pop(sym)
+                                send_telegram_msg(f"⚠️ **PANIC:** تم إغلاق جميع الصفقات الـ ({count}) بنجاح!")
 
                         # 4. أمر إغلاق عملة معينة /close SYMBOL
-                        elif text.startswith("/close "):
-                            sym_to_close = text.split(" ")[1].upper()
+                        elif text.startswith("/close"):
+                            parts = text.split(" ")
+                            if len(parts) < 2:
+                                send_telegram_msg("💡 يرجى كتابة الرمز، مثال: `/close btc`")
+                                continue
+                            
+                            sym_to_close = parts[1].upper()
                             if not sym_to_close.endswith("/USDT"): sym_to_close += "/USDT"
                             
                             if sym_to_close in portfolio["open_trades"]:
                                 trade = portfolio["open_trades"][sym_to_close]
                                 VIRTUAL_BALANCE += trade['amount_usd']
                                 portfolio["open_trades"].pop(sym_to_close)
-                                send_telegram_msg(f"✅ تم إغلاق `{sym_to_close}` يدوياً.")
+                                send_telegram_msg(f"✅ تم إغلاق `{sym_to_close}` يدوياً وإعادة السيولة.")
                             else:
-                                send_telegram_msg(f"❌ العملة `{sym_to_close}` غير موجودة في الصفقات.")
+                                send_telegram_msg(f"❌ العملة `{sym_to_close}` غير موجودة في محفظتك.")
 
         except Exception as e:
             print(f"Telegram Command Error: {e}")
-        time.sleep(2)
+        time.sleep(1)
 
-# ======================== 3. محرك التحليل والإدارة (الكود السابق) ========================
+# ======================== 3. محرك التحليل والإدارة ========================
 
 def get_indicators(df):
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
@@ -106,9 +116,9 @@ async def scan_market():
             if sym in portfolio["open_trades"]: continue
             bars = await EXCHANGE.fetch_ohlcv(sym, timeframe='15m', limit=50)
             df = get_indicators(pd.DataFrame(bars, columns=['ts','open','high','low','close','vol']))
-            last, prev = df.iloc[-1], df.iloc[-2]
+            last = df.iloc[-1]
             
-            # سكور 8/8 مبسط للسرعة
+            # فلترة 8/8 للاقتناص
             if last['close'] > last['ema9'] and last['mfi'] > 60 and last['vol'] > df['vol'].tail(10).mean() * 1.5:
                 entry_price = last['close']
                 portfolio["open_trades"][sym] = {
@@ -116,7 +126,7 @@ async def scan_market():
                     "coins": BASE_TRADE_USD / entry_price, "amount_usd": BASE_TRADE_USD, "trailing_active": False
                 }
                 VIRTUAL_BALANCE -= BASE_TRADE_USD
-                send_telegram_msg(f"🚀 دخول: `{sym}` @ {entry_price:.6f}")
+                send_telegram_msg(f"🚀 **دخول جديد:** `{sym}`\n💵 السعر: `{entry_price:.6f}`")
                 break
     except: pass
 
@@ -128,6 +138,7 @@ async def manage_trades():
                 trade = portfolio["open_trades"][sym]
                 ticker = await EXCHANGE.fetch_ticker(sym)
                 cp = ticker['last']
+                
                 if cp > trade['highest_price']: portfolio["open_trades"][sym]['highest_price'] = cp
                 profit_pct = (cp - trade['entry_price']) / trade['entry_price']
                 
@@ -139,11 +150,11 @@ async def manage_trades():
                         VIRTUAL_BALANCE += (trade['amount_usd'] + pnl)
                         closed_trades_history.append({"pnl": pnl})
                         portfolio["open_trades"].pop(sym)
-                        send_telegram_msg(f"💰 ربح: `{sym}` | ${pnl:.2f}")
+                        send_telegram_msg(f"💰 **إغلاق ربح (M) :** `{sym}` | `${pnl:.2f}`")
                 elif profit_pct <= -0.03:
                     VIRTUAL_BALANCE += (trade['coins'] * cp)
                     portfolio["open_trades"].pop(sym)
-                    send_telegram_msg(f"🛑 وقف خسارة: `{sym}`")
+                    send_telegram_msg(f"🛑 **وقف خسارة:** `{sym}`")
             await asyncio.sleep(10)
         except: await asyncio.sleep(5)
 
@@ -155,7 +166,7 @@ def send_telegram_msg(msg):
 
 app = Flask('')
 @app.route('/')
-def home(): return f"Active - Trades: {len(portfolio['open_trades'])}"
+def home(): return f"Active - Balance: {VIRTUAL_BALANCE:.2f}"
 
 async def main_loop():
     asyncio.create_task(manage_trades())
@@ -164,8 +175,9 @@ async def main_loop():
         await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    # تشغيل مستمع الأوامر في Thread منفصل
+    # تشغيل مستمع الأوامر في Thread منفصل لضمان استجابة تليجرام الفورية
     threading.Thread(target=handle_telegram_commands, daemon=True).start()
+    # تشغيل سيرفر الويب لضمان بقاء الاستضافة نشطة
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
+    # تشغيل المحرك الرئيسي
     asyncio.run(main_loop())
-    
