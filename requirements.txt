@@ -1,4 +1,4 @@
-ccxt
-pandas
-pandas_ta
+ccxt==4.2.19
 requests
+pandas
+
