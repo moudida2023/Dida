@@ -1,7 +1,5 @@
 ccxt==4.2.19
 requests
 pandas
-ccxt
-requests
 pandas_ta
 
