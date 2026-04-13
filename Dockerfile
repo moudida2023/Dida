@@ -1,26 +1,26 @@
 # استخدام نسخة بايثون خفيفة ومستقرة
 FROM python:3.10-slim
 
-# تثبيت الأدوات اللازمة للتعامل مع PostgreSQL داخل النظام
-RUN apt-get update && apt-get install -y \
-    libpq-dev \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# منع بايثون من إنشاء ملفات .pyc وتأخير إخراج البيانات (Logs)
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
-# تحديد مجلد العمل داخل الحاوية
+# تحديد مجلد العمل داخل السيرفر
 WORKDIR /app
 
-# نسخ ملف المكتبات أولاً لتسريع عملية البناء
+# تثبيت الأدوات اللازمة للنظام
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# نسخ ملف المتطلبات أولاً لتسريع عملية البناء
 COPY requirements.txt .
 
-# تثبيت مكتبات بايثون
+# تثبيت المكتبات البرمجية
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي ملفات المشروع إلى الحاوية
+# نسخ باقي ملفات الكود إلى السيرفر
 COPY . .
 
-# تحديد المنفذ (Port) الذي سيعمل عليه Flask
-EXPOSE 10000
-
-# أمر تشغيل البوت
+# أمر تشغيل البوت (افترضنا أن اسم ملف الكود هو bot.py)
 CMD ["python", "app.py"]
