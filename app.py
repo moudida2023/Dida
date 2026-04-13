@@ -1,6 +1,6 @@
 import ccxt
 import pandas as pd
-import numpy as np
+import pandas_ta as ta
 import time
 import requests
 import json
@@ -8,193 +8,235 @@ import os
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-# ==========================================
-# 🔑 الإعدادات الخاصة بك
-# ==========================================
-TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
-TELEGRAM_CHAT_ID = '5067771509'
+# --- إعدادات الاتصال والهوية ---
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 
-# ==========================================
-# ⚙️ إعدادات الإدارة والمخاطر
-# ==========================================
-TOTAL_POSITIONS = 20
-DAILY_TARGET_PCT = 6.0
+# --- إعدادات الإدارة الصارمة ---
+MAX_OPEN_POSITIONS = 20
+DAILY_CEILING = 6.0        # سقف الربح اليومي 6%
+CAUTION_ZONE = 4.0         # منطقة رفع السكور (الجودة العالية)
+BTC_CRASH_LIMIT = -2.0     # قاطع التيار للبيتكوين
 BALANCE_FILE = "trading_state.json"
-HISTORY_FILE = "trade_history.json"
+
+# --- تعريف المنصة (Gate.io) ---
 exchange = ccxt.gateio({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
-# قوائم القطاعات (عملات أساسية وقوية)
+# --- متغيرات الحالة ---
+open_positions = {}
+sector_allocations = {}
+closed_today = []  # قائمة العملات الممنوعة من التكرار اليوم
+
 SECTORS = {
-    'AI': ['FET', 'RNDR', 'NEAR', 'TAO', 'GRT', 'AKT'],
-    'L1_L2': ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC', 'OP', 'ARB', 'SUI'],
-    'MEME': ['DOGE', 'SHIB', 'PEPE', 'FLOKI', 'BONK', 'WIF'],
-    'DEFI': ['UNI', 'AAVE', 'LINK', 'CAKE', 'RUNE', 'PENDLE']
+    'AI': ['FET', 'RNDR', 'NEAR', 'TAO', 'GRT', 'AKT', 'OCEAN', 'PHB'],
+    'L1_L2': ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC', 'OP', 'ARB', 'SUI', 'DOT'],
+    'MEME': ['DOGE', 'SHIB', 'PEPE', 'FLOKI', 'BONK', 'WIF', 'LADYS'],
+    'DEFI': ['UNI', 'AAVE', 'LINK', 'CAKE', 'RUNE', 'PENDLE', 'JOE'],
+    'GAMING': ['GALA', 'IMX', 'BEAM', 'AXS', 'SAND', 'MANA', 'NAKA']
 }
 
-open_positions = {}
-trade_history = []
-sector_allocs = {}
-last_update_id = 0
-
-# --- المعادلات الفنية ---
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / (loss + 1e-9)
-    return 100 - (100 / (1 + rs))
-
-def calculate_ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def calculate_macd(series, slow=26, fast=12, signal=9):
-    fast_ema = calculate_ema(series, fast)
-    slow_ema = calculate_ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
-
-# --- إدارة الحالة ---
+# --- نظام حفظ وإدارة الرصيد ---
 def load_state():
-    global trade_history
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r') as f: trade_history = json.load(f)
-        except: trade_history = []
     if os.path.exists(BALANCE_FILE):
         try:
-            with open(BALANCE_FILE, 'r') as f: return json.load(f)
+            with open(BALANCE_FILE, 'r') as f:
+                return json.load(f)
         except: pass
-    return {"equity": 1000.0, "day_start": 1000.0, "date": str(datetime.now().date())}
+    return {"total_equity": 1000.0, "daily_start": 1000.0, "last_reset": str(datetime.now().date())}
 
-state = load_state()
-VIRTUAL_CASH = state["equity"]
-DAY_START_VAL = state["day_start"]
-LAST_DATE = datetime.strptime(state["date"], '%Y-%m-%d').date()
-POS_SIZE = VIRTUAL_CASH / TOTAL_POSITIONS
+def save_state():
+    current_equity = get_current_equity()
+    state = {
+        "total_equity": current_equity,
+        "daily_start": DAILY_START_BALANCE,
+        "last_reset": str(LAST_RESET_DATE)
+    }
+    with open(BALANCE_FILE, 'w') as f:
+        json.dump(state, f)
 
-def send_msg(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={text}&parse_mode=Markdown"
-    try: requests.get(url, timeout=5)
+# تهيئة البيانات
+state_data = load_state()
+VIRTUAL_BALANCE = state_data["total_equity"]
+DAILY_START_BALANCE = state_data["daily_start"]
+LAST_RESET_DATE = datetime.strptime(state_data["last_reset"], '%Y-%m-%d').date()
+POSITION_SIZE = VIRTUAL_BALANCE / MAX_OPEN_POSITIONS
+
+# --- وظائف المساعدة والتحليل ---
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={msg}&parse_mode=Markdown"
+    try: requests.get(url, timeout=10)
     except: pass
 
-def save_current_state():
-    with open(BALANCE_FILE, 'w') as f:
-        json.dump({"equity": VIRTUAL_CASH, "day_start": DAY_START_VAL, "date": str(LAST_DATE)}, f)
-    with open(HISTORY_FILE, 'w') as f:
-        json.dump(trade_history[-20:], f)
+def get_sector(symbol):
+    coin = symbol.split('/')[0]
+    for s, coins in SECTORS.items():
+        if coin in coins: return s
+    return 'OTHERS'
 
-# ==========================================
-# 🎯 محرك التداول (مع فلتر الحماية)
-# ==========================================
-def process_symbol(symbol):
-    global VIRTUAL_CASH
-    if symbol in open_positions or len(open_positions) >= TOTAL_POSITIONS:
-        return
+def get_current_equity():
+    return VIRTUAL_BALANCE + (len(open_positions) * POSITION_SIZE)
+
+def update_sector_strength():
+    """تحليل أقوى القطاعات لتوزيع الـ 20 صفقة عليها"""
+    global sector_allocations
+    strengths = {}
+    for sector, coins in SECTORS.items():
+        changes = []
+        for coin in coins[:4]:
+            try:
+                t = exchange.fetch_ticker(f"{coin}/USDT")
+                changes.append(t['percentage'])
+            except: continue
+        strengths[sector] = sum(changes)/len(changes) if changes else -99
+
+    sorted_sec = sorted(strengths.items(), key=lambda x: x[1], reverse=True)
+    alloc_map = [7, 5, 3, 3, 2] # توزيع الحصص من الـ 20 صفقة
+    
+    sector_allocations = {sec: (alloc_map[i] if i < len(alloc_map) else 1) for i, (sec, val) in enumerate(sorted_sec)}
+    
+    report = "📊 *التوزيع القطاعي الجديد:*\n" + "\n".join([f"🔸 {k}: {v} صفقات" for k,v in sector_allocations.items()])
+    send_telegram(report)
+
+def reset_daily_params():
+    """إعادة استثمار الأرباح وتصفير قائمة الممنوعات كل صباح"""
+    global VIRTUAL_BALANCE, POSITION_SIZE, DAILY_START_BALANCE, LAST_RESET_DATE, closed_today
+    current_equity = get_current_equity()
+    DAILY_START_BALANCE = current_equity
+    POSITION_SIZE = current_equity / MAX_OPEN_POSITIONS
+    LAST_RESET_DATE = datetime.now().date()
+    closed_today = [] # تصفير قائمة العملات المتداولة لبدء يوم جديد
+    save_state()
+    send_telegram(f"🔄 *بداية يوم جديد*\n💰 الرصيد: {current_equity:.2f}$\n📏 حجم الصفقة الجديد: {POSITION_SIZE:.2f}$")
+
+# --- محرك البحث والتحليل ---
+def fetch_and_analyze(symbol):
+    global VIRTUAL_BALANCE
+    # منع التكرار: لا تدخل إذا كانت مفتوحة أو تم تداولها اليوم
+    if symbol in open_positions or symbol in closed_today: return
+    if len(open_positions) >= MAX_OPEN_POSITIONS: return
 
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
-        df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+        current_eq = get_current_equity()
+        daily_profit = ((current_eq - DAILY_START_BALANCE) / DAILY_START_BALANCE) * 100
+        if daily_profit >= DAILY_CEILING: return
         
-        # حساب المؤشرات
-        df['ema9'], df['ema21'] = calculate_ema(df['c'], 9), calculate_ema(df['c'], 21)
-        df['rsi'], (df['m'], df['sig']) = calculate_rsi(df['c']), calculate_macd(df['c'])
-        
-        last = df.iloc[-1]
-        score = (20 if last['ema9'] > last['ema21'] else 0) + \
-                (30 if last['v'] > (df['v'].tail(15).mean() * 1.5) else 0) + \
-                (20 if 50 < last['rsi'] < 70 else 0) + \
-                (30 if last['m'] > last['sig'] else 0)
-        
-        if score >= 88:
-            coin = symbol.split('/')[0]
-            sec = next((s for s, cs in SECTORS.items() if coin in cs), 'OTHERS')
-            if sum(1 for p in open_positions.values() if p['sec'] == sec) >= sector_allocs.get(sec, 1):
-                return
+        sec = get_sector(symbol)
+        allowed = sector_allocations.get(sec, 1)
+        if sum(1 for s in open_positions if get_sector(s) == sec) >= allowed: return
 
-            VIRTUAL_CASH -= POS_SIZE
+        # جلب الشموع والتحليل
+        data = {}
+        for tf in ['4h', '1h', '15m']:
+            bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=70)
+            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            df.ta.ema(length=9, append=True); df.ta.ema(length=21, append=True)
+            df.ta.rsi(length=14, append=True); df.ta.macd(append=True)
+            data[tf] = df
+
+        # حساب سكور الجودة
+        scores = {}
+        for tf in ['4h', '1h', '15m']:
+            df = data[tf]; last = df.iloc[-1]; s = 0
+            if last['EMA_9'] > last['EMA_21']: s += 20
+            if last['v'] > (df['v'].tail(15).mean() * 1.3): s += 25
+            if 50 < last['RSI_14'] < 70: s += 15
+            if last['MACD_12_26_9'] > last['MACDs_12_26_9']: s += 20
+            if last['c'] > df['h'].iloc[-11:-1].max(): s += 20
+            scores[tf] = s
+        
+        total_score = (scores['4h']*0.2) + (scores['1h']*0.3) + (scores['15m']*0.5)
+        required = 92 if daily_profit >= CAUTION_ZONE else 88
+        
+        if total_score >= required:
+            price = data['15m'].iloc[-1]['c']
+            VIRTUAL_BALANCE -= POSITION_SIZE
             open_positions[symbol] = {
-                'entry': last['c'], 'stop': last['c']*0.99, 'high': last['c'], 
-                'trailing': False, 'sec': sec, 'time': time.time()
+                'entry': price, 'stop': price * 0.99, 'high': price, 
+                'time': datetime.now(), 'trailing': False, 'sector': sec
             }
-            send_msg(f"🚀 *Buy {symbol}* (Score: {score})")
+            send_telegram(f"🚀 *دخول صفقة*\n🪙 {symbol}\n💰 السعر: {price}\n⭐ سكور: {total_score:.1f}")
     except: pass
 
-def monitor():
+# --- إدارة الخروج والرقابة ---
+def monitor_market():
+    global VIRTUAL_BALANCE, closed_today
+    try:
+        btc = exchange.fetch_ticker('BTC/USDT')
+        if btc['percentage'] <= BTC_CRASH_LIMIT:
+            for s in list(open_positions.keys()): close_trade(s, exchange.fetch_ticker(s)['last'], "🚨 طوارئ BTC")
+            return
+    except: pass
+
     for s in list(open_positions.keys()):
         try:
             curr = exchange.fetch_ticker(s)['last']
             pos = open_positions[s]
+            elapsed = (datetime.now() - pos['time']).total_seconds() / 3600
+
+            # التتبع السعري (Trailing)
             if curr >= pos['entry'] * 1.01:
                 pos['trailing'] = True
                 if curr > pos['high']:
                     pos['high'] = curr
                     pos['stop'] = max(pos['stop'], curr * 0.99)
-            if curr <= pos['stop'] or (time.time() - pos['time'] > 21600 and not pos['trailing']):
-                close_logic(s, curr, "Exit Strategy")
+
+            if curr <= pos['stop']:
+                close_trade(s, curr, "🛡️ تتبع" if pos['trailing'] else "❌ وقف")
+            elif elapsed > 6 and not pos['trailing']:
+                close_trade(s, curr, "⏳ خروج زمني")
         except: pass
 
-def close_logic(symbol, price, reason):
-    global VIRTUAL_CASH, trade_history
+def close_trade(symbol, price, reason):
+    global VIRTUAL_BALANCE, closed_today
     pos = open_positions[symbol]
-    pnl = ((price - pos['entry']) / pos['entry']) * 100
-    VIRTUAL_CASH += POS_SIZE * (1 + (pnl/100))
-    trade_history.append({"symbol": symbol, "pnl": round(pnl, 2), "reason": reason})
-    save_current_state()
-    send_msg(f"🚪 *Closed {symbol}* ({pnl:+.2f}%)")
+    profit_pct = ((price - pos['entry']) / pos['entry']) * 100
+    VIRTUAL_BALANCE += POSITION_SIZE * (1 + (profit_pct/100))
+    
+    # إضافة العملة للقائمة السوداء اليومية لمنع تكرارها
+    closed_today.append(symbol)
+    
+    save_state()
+    send_telegram(f"🚪 *إغلاق صفقة*\n🪙 {symbol}\n📝 {reason}\n📈 ربح: {profit_pct:.2f}%\n💰 الرصيد الإجمالي: {get_current_equity():.2f}$")
     del open_positions[symbol]
 
-def handle_telegram_commands():
-    global last_update_id
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}"
+# --- الدورة الرئيسية ---
+last_sector_update = 0
+last_hourly_report = datetime.now().hour
+
+send_telegram("🦾 *Apex Sentinel* مفعل وجاهز للعمل...")
+
+while True:
     try:
-        resp = requests.get(url, timeout=5).json()
-        if not resp.get("result"): return
-        for update in resp["result"]:
-            last_update_id = update["update_id"]
-            msg = update.get("message", {})
-            text = msg.get("text", "")
-            if str(msg.get("chat", {}).get("id", "")) != TELEGRAM_CHAT_ID: continue
+        now = datetime.now()
+        
+        # فحص اليوم الجديد
+        if now.date() > LAST_RESET_DATE:
+            reset_daily_params()
 
-            if text == "/liste_o":
-                if not open_positions: send_msg("📭 لا توجد صفقات.")
-                else:
-                    lines = [f"🔹 `{s}`: {((exchange.fetch_ticker(s)['last']-p['entry'])/p['entry'])*100:+.2f}%" for s, p in open_positions.items()]
-                    send_msg("📋 *المفتوحة:*\n" + "\n".join(lines))
-            elif text == "/report":
-                send_msg(f"💰 الرصيد التقديري: {VIRTUAL_CASH + (len(open_positions)*POS_SIZE):.2f}$")
-    except: pass
+        # تحديث قوة القطاعات كل 4 ساعات
+        if time.time() - last_sector_update > 4 * 3600:
+            update_sector_strength()
+            last_sector_update = time.time()
 
-# ==========================================
-# 🔄 الحلقة الرئيسية (المسح المنظم)
-# ==========================================
-if __name__ == "__main__":
-    send_msg("🤖 *Apex Sentinel* Live (Protection Filter Active)")
-    while True:
-        try:
-            # 1. تحديث البيانات اليومية
-            now = datetime.now()
-            if now.date() > LAST_DATE:
-                VIRTUAL_CASH += (len(open_positions) * POS_SIZE)
-                DAY_START_VAL, LAST_DATE = VIRTUAL_CASH, now.date()
-                POS_SIZE = VIRTUAL_CASH / TOTAL_POSITIONS
-                save_current_state()
+        # تقرير الساعة
+        if now.hour != last_hourly_report:
+            eq = get_current_equity()
+            send_telegram(f"📊 *تقرير الساعة*\n💰 رصيد: {eq:.2f}$\n📈 نمو اليوم: {((eq-DAILY_START_BALANCE)/DAILY_START_BALANCE)*100:.2f}%")
+            last_hourly_report = now.hour
 
-            # 2. أوامر تلغرام والمراقبة
-            handle_telegram_commands()
-            monitor()
+        monitor_market()
+        
+        # المسح إذا لم نصل للهدف
+        eq_check = get_current_equity()
+        if ((eq_check - DAILY_START_BALANCE) / DAILY_START_BALANCE) * 100 < DAILY_CEILING:
+            tickers = exchange.fetch_tickers()
+            # ترتيب حسب السيولة ومسح أفضل 800 عملة تزيد سيولتها عن 100 ألف دولار
+            sorted_t = sorted(tickers.items(), key=lambda x: x[1]['quoteVolume'] if x[1]['quoteVolume'] else 0, reverse=True)
+            targets = [s for s, t in sorted_t if '/USDT' in s and t['quoteVolume'] > 100000][:800]
             
-            # 3. مسح السوق مع فلتر العملات الرافعة (3L, 3S, 5L, 5S)
-            all_tkrs = exchange.fetch_tickers()
-            symbols = [
-                s for s, t in sorted(all_tkrs.items(), key=lambda x: x[1]['quoteVolume'] or 0, reverse=True) 
-                if '/USDT' in s 
-                and not any(bad in s for bad in ['3L', '3S', '5L', '5S', 'BEAR', 'BULL']) # الفلتر القوي
-            ][:800]
-            
-            # توزيع الصفقات بناءً على أداء السوق اللحظي
             with ThreadPoolExecutor(max_workers=15) as exe:
-                exe.map(process_symbol, symbols)
-            
-            time.sleep(30)
-        except: time.sleep(10)
+                exe.map(fetch_and_analyze, targets)
+        
+        time.sleep(60)
+    except Exception as e:
+        time.sleep(30)
