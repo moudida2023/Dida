@@ -1,8 +1,4 @@
-flask
 ccxt
 pandas
-psycopg2-binary
+pandas_ta
 requests
-asyncio
-gunicorn
-waitress
