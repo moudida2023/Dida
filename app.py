@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
 
+
+TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
+CHAT_ID = '5067771509' 
+
 # --- متغيرات المحفظة وإدارة المخاطر ---
 MAX_OPEN_POSITIONS = 20
 DAILY_CEILING = 6.0        # سقف الربح اليومي 6%
