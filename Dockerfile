@@ -1,27 +1,24 @@
-
-# استخدام نسخة بايثون خفيفة ومستقرة
+# استخدام نسخة بايثون مستقرة وخفيفة
 FROM python:3.10-slim
 
-# تثبيت الأدوات اللازمة للتعامل مع PostgreSQL داخل النظام
+# تثبيت أدوات النظام الضرورية لبناء المكتبات (مثل pandas و numpy)
 RUN apt-get update && apt-get install -y \
-    libpq-dev \
     gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # تحديد مجلد العمل داخل الحاوية
 WORKDIR /app
 
-# نسخ ملف المكتبات أولاً لتسريع عملية البناء
-COPY requirements.txt .
+# تحديث pip أولاً لتجنب مشاكل الإصدارات القديمة
+RUN pip install --no-cache-dir --upgrade pip
 
-# تثبيت مكتبات بايثون
+# نسخ ملف المتطلبات وتثبيته
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي ملفات المشروع إلى الحاوية
+# نسخ ملفات المشروع (main.py و trading_state.json إذا وجد)
 COPY . .
-
-# تحديد المنفذ (Port) الذي سيعمل عليه Flask
-EXPOSE 10000
 
 # أمر تشغيل البوت
 CMD ["python", "app.py"]
