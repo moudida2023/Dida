@@ -1,19 +1,19 @@
-# استخدام نسخة بايثون مستقرة
-FROM python:3.10-slim
+# استخدام النسخة الكاملة لتجنب مشاكل بناء pandas و ccxt
+FROM python:3.10
 
-# تثبيت أدوات النظام الضرورية لبناء المكتبات (مثل pandas)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
+# منع بايثون من إنشاء ملفات مؤقتة
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
 # تحديد مجلد العمل
 WORKDIR /app
 
-# نسخ ملف المتطلبات وتثبيته
+# نسخ الملفات
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+
+# تحديث pip وتثبيت المكتبات
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
 
 # نسخ باقي الكود
 COPY . .
