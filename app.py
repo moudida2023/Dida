@@ -20,6 +20,7 @@ TELEGRAM_CHAT_ID = '5067771509'
 TOTAL_POSITIONS = 20
 DAILY_TARGET_PCT = 6.0
 BALANCE_FILE = "trading_state.json"
+HISTORY_FILE = "trade_history.json"
 exchange = ccxt.gateio({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
 SECTORS = {
@@ -31,11 +32,12 @@ SECTORS = {
 
 # متغيرات الحالة
 open_positions = {}
+trade_history = []
 sector_allocs = {}
 last_update_id = 0
 
 # ==========================================
-# 📈 المحرك التقني (يدوي بدون مكتبات خارجية)
+# 📈 المحرك التقني
 # ==========================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
@@ -55,9 +57,15 @@ def calculate_macd(series, slow=26, fast=12, signal=9):
     return macd_line, signal_line
 
 # ==========================================
-# 📂 إدارة الرصيد والبيانات
+# 📂 إدارة البيانات
 # ==========================================
 def load_state():
+    global trade_history
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r') as f: trade_history = json.load(f)
+        except: trade_history = []
+        
     if os.path.exists(BALANCE_FILE):
         try:
             with open(BALANCE_FILE, 'r') as f: return json.load(f)
@@ -78,9 +86,11 @@ def send_msg(text):
 def save_current_state():
     with open(BALANCE_FILE, 'w') as f:
         json.dump({"equity": VIRTUAL_CASH, "day_start": DAY_START_VAL, "date": str(LAST_DATE)}, f)
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(trade_history[-20:], f) # حفظ آخر 20 صفقة فقط لتوفير المساحة
 
 # ==========================================
-# 🎮 أوامر تلغرام التفاعلية
+# 🎮 أوامر تلغرام (الأوامر الجديدة مضافة هنا)
 # ==========================================
 def handle_telegram_commands():
     global last_update_id, VIRTUAL_CASH
@@ -96,57 +106,63 @@ def handle_telegram_commands():
             if cid != TELEGRAM_CHAT_ID: continue
 
             if text == "/start":
-                send_msg("👋 *Apex Sentinel Online*\n\n/report - تقرير الحالة\n/panic - إغلاق الكل فوراً\n/close [العملة] - إغلاق يدوي")
+                send_msg("👋 *Apex Sentinel Online*\n\n/liste_o - الصفقات المفتوحة\n/liste_f - الصفقات المغلقة\n/report - ملخص المحفظة\n/panic - إغلاق الكل")
             
+            elif text == "/liste_o":
+                if not open_positions:
+                    send_msg("📭 لا توجد صفقات مفتوحة حالياً.")
+                else:
+                    lines = ["📋 *الصفقات المفتوحة:*"]
+                    for s, p in open_positions.items():
+                        try:
+                            curr = exchange.fetch_ticker(s)['last']
+                            pnl = ((curr - p['entry']) / p['entry']) * 100
+                            lines.append(f"🔹 `{s}`: {pnl:+.2f}% (دخول: {p['entry']})")
+                        except: lines.append(f"🔹 `{s}`: جاري جلب السعر...")
+                    send_msg("\n".join(lines))
+
+            elif text == "/liste_f":
+                if not trade_history:
+                    send_msg("📭 لا يوجد سجل صفقات مغلقة بعد.")
+                else:
+                    lines = ["✅ *آخر الصفقات المغلقة:*"]
+                    for h in trade_history[-10:]: # عرض آخر 10
+                        lines.append(f"🏁 `{h['symbol']}`: {h['pnl']:+.2f}% ({h['reason']})")
+                    send_msg("\n".join(lines))
+
             elif text == "/report":
                 eq = VIRTUAL_CASH + (len(open_positions) * POS_SIZE)
                 pnl = ((eq - DAY_START_VAL) / DAY_START_VAL) * 100
-                rep = f"📊 *تقرير المحفظة*\n💰 الرصيد: {eq:.2f}$\n📈 ربح اليوم: {pnl:+.2f}%\n📦 الصفقات: {len(open_positions)}"
-                if open_positions:
-                    rep += "\n\n*العملات المفتوحة:*\n" + "\n".join([f"• `{s}`" for s in open_positions.keys()])
+                rep = f"📊 *تقرير المحفظة*\n💰 الرصيد: {eq:.2f}$\n📈 اليوم: {pnl:+.2f}%\n📦 مفتوحة: {len(open_positions)}"
                 send_msg(rep)
 
             elif text == "/panic":
-                send_msg("⚠️ *Panic Mode:* جاري إغلاق كل شيء...")
+                send_msg("🚨 *Panic:* جاري إغلاق الكل...")
                 for s in list(open_positions.keys()):
                     p = exchange.fetch_ticker(s)['last']
-                    close_logic(s, p, "🚨 Panic Command")
-                send_msg("✅ تم تصفير المحفظة.")
-
-            elif text.startswith("/close"):
-                parts = text.split()
-                if len(parts) > 1:
-                    sym = parts[1].upper()
-                    if sym in open_positions:
-                        p = exchange.fetch_ticker(sym)['last']
-                        close_logic(sym, p, "Manual Close")
-                    else: send_msg(f"❌ `{sym}` غير موجودة.")
+                    close_logic(s, p, "Panic")
+                send_msg("✅ تم تصفير الصفقات.")
     except: pass
 
 # ==========================================
-# 🎯 محرك التداول والمراقبة
+# 🎯 محرك التداول
 # ==========================================
-def analyze_sectors():
-    global sector_allocs
-    scores = {}
-    for sec, coins in SECTORS.items():
-        changes = []
-        for c in coins[:3]:
-            try: changes.append(exchange.fetch_ticker(f"{c}/USDT")['percentage'])
-            except: continue
-        scores[sec] = sum(changes)/len(changes) if changes else -99
-    sorted_sec = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    mapping = [7, 5, 4, 2, 2]
-    sector_allocs = {s: (mapping[i] if i < len(mapping) else 1) for i, (s, v) in enumerate(sorted_sec)}
-    send_msg(f"🌍 *Sector Update:* {list(sector_allocs.keys())[0]} is Hot 🔥")
-
 def close_logic(symbol, price, reason):
-    global VIRTUAL_CASH
+    global VIRTUAL_CASH, trade_history
     pos = open_positions[symbol]
     pnl = ((price - pos['entry']) / pos['entry']) * 100
     VIRTUAL_CASH += POS_SIZE * (1 + (pnl/100))
+    
+    # إضافة الصفقة للسجل
+    trade_history.append({
+        "symbol": symbol,
+        "pnl": round(pnl, 2),
+        "reason": reason,
+        "time": str(datetime.now())
+    })
+    
     save_current_state()
-    send_msg(f"🚪 *Closed {symbol}*\nPNL: {pnl:+.2f}%\nReason: {reason}")
+    send_msg(f"🚪 *إغلاق {symbol}*\nالربح: {pnl:+.2f}%\nالسبب: {reason}")
     del open_positions[symbol]
 
 def monitor():
@@ -160,7 +176,7 @@ def monitor():
                     pos['high'] = curr
                     pos['stop'] = max(pos['stop'], curr * 0.99)
             if curr <= pos['stop'] or (time.time() - pos['time'] > 21600 and not pos['trailing']):
-                close_logic(s, curr, "🛡️ Exit Logic")
+                close_logic(s, curr, "Exit Logic")
         except: pass
 
 def process_symbol(symbol):
@@ -185,14 +201,28 @@ def process_symbol(symbol):
         if score >= 88:
             VIRTUAL_CASH -= POS_SIZE
             open_positions[symbol] = {'entry': last['c'], 'stop': last['c']*0.99, 'high': last['c'], 'trailing': False, 'sec': sec, 'time': time.time()}
-            send_msg(f"🚀 *Buy {symbol}* (Score: {score})")
+            send_msg(f"🚀 *شراء {symbol}* (سكور: {score})")
     except: pass
 
+def analyze_sectors():
+    global sector_allocs
+    scores = {}
+    for sec, coins in SECTORS.items():
+        changes = []
+        for c in coins[:3]:
+            try: changes.append(exchange.fetch_ticker(f"{c}/USDT")['percentage'])
+            except: continue
+        scores[sec] = sum(changes)/len(changes) if changes else -99
+    sorted_sec = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    mapping = [7, 5, 4, 2, 2]
+    sector_allocs = {s: (mapping[i] if i < len(mapping) else 1) for i, (s, v) in enumerate(sorted_sec)}
+    send_msg(f"🌍 *تحديث القطاعات:* {list(sector_allocs.keys())[0]} متصدر")
+
 # ==========================================
-# 🔄 التشغيل الرئيسي
+# 🔄 التشغيل
 # ==========================================
 if __name__ == "__main__":
-    send_msg("🤖 *Apex Sentinel Activated*")
+    send_msg("🤖 *Apex Sentinel* جاهز للعمل.")
     analyze_sectors()
     while True:
         try:
