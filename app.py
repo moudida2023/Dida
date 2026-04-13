@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ⚙️ إعدادات الاتصال (بياناتك الشخصية)
 # ==========================================
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
-CHAT_ID = '5067771509'
+CHAT_ID = '-1003692815602'
 
 # ==========================================
 # 📊 إدارة المخاطر والمحفظة
