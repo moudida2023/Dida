@@ -1,22 +1,27 @@
-# استخدام النسخة الكاملة لتجنب مشاكل بناء pandas و ccxt
-FROM python:3.10
 
-# منع بايثون من إنشاء ملفات مؤقتة
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+# استخدام نسخة بايثون خفيفة ومستقرة
+FROM python:3.10-slim
 
-# تحديد مجلد العمل
+# تثبيت الأدوات اللازمة للتعامل مع PostgreSQL داخل النظام
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# تحديد مجلد العمل داخل الحاوية
 WORKDIR /app
 
-# نسخ الملفات
+# نسخ ملف المكتبات أولاً لتسريع عملية البناء
 COPY requirements.txt .
 
-# تحديث pip وتثبيت المكتبات
-RUN pip install --upgrade pip
+# تثبيت مكتبات بايثون
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي الكود
+# نسخ باقي ملفات المشروع إلى الحاوية
 COPY . .
 
-# تشغيل البوت
+# تحديد المنفذ (Port) الذي سيعمل عليه Flask
+EXPOSE 10000
+
+# أمر تشغيل البوت
 CMD ["python", "app.py"]
