@@ -9,22 +9,19 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
-# 🔑 إعدادات الاتصال (بياناتك الخاصة)
+# 🔑 الإعدادات الخاصة بك
 # ==========================================
 TELEGRAM_TOKEN = '8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68'
 TELEGRAM_CHAT_ID = '5067771509'
 
 # ==========================================
-# ⚙️ إعدادات المحفظة وإدارة المخاطر
+# ⚙️ إعدادات الإدارة والمخاطر
 # ==========================================
 TOTAL_POSITIONS = 20
-DAILY_TARGET_PCT = 6.0     
+DAILY_TARGET_PCT = 6.0
 BALANCE_FILE = "trading_state.json"
-
-# تعريف منصة Gate.io
 exchange = ccxt.gateio({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
-# تصنيف القطاعات للدراسة اليومية
 SECTORS = {
     'AI': ['FET', 'RNDR', 'NEAR', 'TAO', 'GRT', 'AKT'],
     'L1_L2': ['BTC', 'ETH', 'SOL', 'AVAX', 'MATIC', 'OP', 'ARB', 'SUI'],
@@ -32,14 +29,19 @@ SECTORS = {
     'DEFI': ['UNI', 'AAVE', 'LINK', 'CAKE', 'RUNE', 'PENDLE']
 }
 
+# متغيرات الحالة
+open_positions = {}
+sector_allocs = {}
+last_update_id = 0
+
 # ==========================================
-# 📈 المعادلات الفنية اليدوية (بديل pandas-ta)
+# 📈 المحرك التقني (يدوي بدون مكتبات خارجية)
 # ==========================================
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
 def calculate_ema(series, period):
@@ -53,7 +55,7 @@ def calculate_macd(series, slow=26, fast=12, signal=9):
     return macd_line, signal_line
 
 # ==========================================
-# 📂 إدارة الحالة (الحفظ التلقائي)
+# 📂 إدارة الرصيد والبيانات
 # ==========================================
 def load_state():
     if os.path.exists(BALANCE_FILE):
@@ -67,119 +69,147 @@ VIRTUAL_CASH = state["equity"]
 DAY_START_VAL = state["day_start"]
 LAST_DATE = datetime.strptime(state["date"], '%Y-%m-%d').date()
 POS_SIZE = VIRTUAL_CASH / TOTAL_POSITIONS
-open_positions = {}
-sector_allocs = {}
 
 def send_msg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={text}&parse_mode=Markdown"
     try: requests.get(url, timeout=5)
     except: pass
 
+def save_current_state():
+    with open(BALANCE_FILE, 'w') as f:
+        json.dump({"equity": VIRTUAL_CASH, "day_start": DAY_START_VAL, "date": str(LAST_DATE)}, f)
+
 # ==========================================
-# 📊 دراسة السوق والتدوير القطاعي
+# 🎮 أوامر تلغرام التفاعلية
+# ==========================================
+def handle_telegram_commands():
+    global last_update_id, VIRTUAL_CASH
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id + 1}"
+    try:
+        resp = requests.get(url, timeout=5).json()
+        if not resp.get("result"): return
+        for update in resp["result"]:
+            last_update_id = update["update_id"]
+            msg = update.get("message", {})
+            text = msg.get("text", "")
+            cid = str(msg.get("chat", {}).get("id", ""))
+            if cid != TELEGRAM_CHAT_ID: continue
+
+            if text == "/start":
+                send_msg("👋 *Apex Sentinel Online*\n\n/report - تقرير الحالة\n/panic - إغلاق الكل فوراً\n/close [العملة] - إغلاق يدوي")
+            
+            elif text == "/report":
+                eq = VIRTUAL_CASH + (len(open_positions) * POS_SIZE)
+                pnl = ((eq - DAY_START_VAL) / DAY_START_VAL) * 100
+                rep = f"📊 *تقرير المحفظة*\n💰 الرصيد: {eq:.2f}$\n📈 ربح اليوم: {pnl:+.2f}%\n📦 الصفقات: {len(open_positions)}"
+                if open_positions:
+                    rep += "\n\n*العملات المفتوحة:*\n" + "\n".join([f"• `{s}`" for s in open_positions.keys()])
+                send_msg(rep)
+
+            elif text == "/panic":
+                send_msg("⚠️ *Panic Mode:* جاري إغلاق كل شيء...")
+                for s in list(open_positions.keys()):
+                    p = exchange.fetch_ticker(s)['last']
+                    close_logic(s, p, "🚨 Panic Command")
+                send_msg("✅ تم تصفير المحفظة.")
+
+            elif text.startswith("/close"):
+                parts = text.split()
+                if len(parts) > 1:
+                    sym = parts[1].upper()
+                    if sym in open_positions:
+                        p = exchange.fetch_ticker(sym)['last']
+                        close_logic(sym, p, "Manual Close")
+                    else: send_msg(f"❌ `{sym}` غير موجودة.")
+    except: pass
+
+# ==========================================
+# 🎯 محرك التداول والمراقبة
 # ==========================================
 def analyze_sectors():
     global sector_allocs
     scores = {}
-    print("🔍 Analyzing sector performance...")
     for sec, coins in SECTORS.items():
         changes = []
         for c in coins[:3]:
             try: changes.append(exchange.fetch_ticker(f"{c}/USDT")['percentage'])
             except: continue
         scores[sec] = sum(changes)/len(changes) if changes else -99
-    
     sorted_sec = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    mapping = [7, 5, 4, 2, 2] 
+    mapping = [7, 5, 4, 2, 2]
     sector_allocs = {s: (mapping[i] if i < len(mapping) else 1) for i, (s, v) in enumerate(sorted_sec)}
-    send_msg(f"📊 *Sector Analysis:* {list(sector_allocs.keys())[0]} is leading the market.")
+    send_msg(f"🌍 *Sector Update:* {list(sector_allocs.keys())[0]} is Hot 🔥")
 
-# ==========================================
-# 🎯 محرك التحليل والتداول
-# ==========================================
-def process_symbol(symbol):
+def close_logic(symbol, price, reason):
     global VIRTUAL_CASH
-    if symbol in open_positions or len(open_positions) >= TOTAL_POSITIONS: return
-    
-    current_eq = VIRTUAL_CASH + (len(open_positions) * POS_SIZE)
-    if ((current_eq - DAY_START_VAL) / DAY_START_VAL) * 100 >= DAILY_TARGET_PCT: return
+    pos = open_positions[symbol]
+    pnl = ((price - pos['entry']) / pos['entry']) * 100
+    VIRTUAL_CASH += POS_SIZE * (1 + (pnl/100))
+    save_current_state()
+    send_msg(f"🚪 *Closed {symbol}*\nPNL: {pnl:+.2f}%\nReason: {reason}")
+    del open_positions[symbol]
 
-    try:
-        coin = symbol.split('/')[0]
-        sec = next((s for s, coins in SECTORS.items() if coin in coins), 'OTHERS')
-        if sum(1 for p in open_positions.values() if p['sec'] == sec) >= sector_allocs.get(sec, 1): return
-
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
-        df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
-        
-        df['ema9'] = calculate_ema(df['c'], 9)
-        df['ema21'] = calculate_ema(df['c'], 21)
-        df['rsi'] = calculate_rsi(df['c'], 14)
-        df['macd'], df['signal'] = calculate_macd(df['c'])
-        
-        last = df.iloc[-1]
-        score = 0
-        if last['ema9'] > last['ema21']: score += 20
-        if last['v'] > (df['v'].tail(15).mean() * 1.5): score += 30
-        if 50 < last['rsi'] < 70: score += 20
-        if last['macd'] > last['signal']: score += 30
-        
-        if score >= 88:
-            price = last['c']
-            VIRTUAL_CASH -= POS_SIZE
-            open_positions[symbol] = {
-                'entry': price, 'stop': price*0.99, 'high': price, 
-                'trailing': False, 'sec': sec, 'time': time.time()
-            }
-            send_msg(f"🚀 *BUY {symbol}*\n⭐ Score: {score}\n📂 Sector: {sec}")
-    except: pass
-
-def monitor_market():
-    global VIRTUAL_CASH
+def monitor():
     for s in list(open_positions.keys()):
         try:
             curr = exchange.fetch_ticker(s)['last']
             pos = open_positions[s]
-            
             if curr >= pos['entry'] * 1.01:
                 pos['trailing'] = True
                 if curr > pos['high']:
                     pos['high'] = curr
                     pos['stop'] = max(pos['stop'], curr * 0.99)
-            
             if curr <= pos['stop'] or (time.time() - pos['time'] > 21600 and not pos['trailing']):
-                pnl = ((curr - pos['entry'])/pos['entry'])*100
-                VIRTUAL_CASH += POS_SIZE * (1 + (pnl/100))
-                with open(BALANCE_FILE, 'w') as f:
-                    json.dump({"equity": VIRTUAL_CASH, "day_start": DAY_START_VAL, "date": str(LAST_DATE)}, f)
-                send_msg(f"🚪 *CLOSE {s}*\n📈 PNL: {pnl:.2f}%\n💵 Balance: {VIRTUAL_CASH + (len(open_positions)*POS_SIZE):.2f}$")
-                del open_positions[s]
+                close_logic(s, curr, "🛡️ Exit Logic")
         except: pass
 
+def process_symbol(symbol):
+    global VIRTUAL_CASH
+    if symbol in open_positions or len(open_positions) >= TOTAL_POSITIONS: return
+    try:
+        coin = symbol.split('/')[0]
+        sec = next((s for s, cs in SECTORS.items() if coin in cs), 'OTHERS')
+        if sum(1 for p in open_positions.values() if p['sec'] == sec) >= sector_allocs.get(sec, 1): return
+        
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+        df = pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+        df['ema9'], df['ema21'] = calculate_ema(df['c'], 9), calculate_ema(df['c'], 21)
+        df['rsi'], (df['m'], df['sig']) = calculate_rsi(df['c']), calculate_macd(df['c'])
+        
+        last = df.iloc[-1]
+        score = (20 if last['ema9'] > last['ema21'] else 0) + \
+                (30 if last['v'] > (df['v'].tail(15).mean() * 1.5) else 0) + \
+                (20 if 50 < last['rsi'] < 70 else 0) + \
+                (30 if last['m'] > last['sig'] else 0)
+        
+        if score >= 88:
+            VIRTUAL_CASH -= POS_SIZE
+            open_positions[symbol] = {'entry': last['c'], 'stop': last['c']*0.99, 'high': last['c'], 'trailing': False, 'sec': sec, 'time': time.time()}
+            send_msg(f"🚀 *Buy {symbol}* (Score: {score})")
+    except: pass
+
 # ==========================================
-# 🔄 الحلقة الرئيسية
+# 🔄 التشغيل الرئيسي
 # ==========================================
 if __name__ == "__main__":
-    send_msg("🤖 *Apex Sentinel* is live and monitoring Gate.io.")
+    send_msg("🤖 *Apex Sentinel Activated*")
     analyze_sectors()
     while True:
         try:
             now = datetime.now()
             if now.date() > LAST_DATE:
-                total = VIRTUAL_CASH + (len(open_positions) * POS_SIZE)
-                VIRTUAL_CASH, DAY_START_VAL = total, total
-                POS_SIZE = total / TOTAL_POSITIONS
-                LAST_DATE = now.date()
+                VIRTUAL_CASH = VIRTUAL_CASH + (len(open_positions) * POS_SIZE)
+                DAY_START_VAL, LAST_DATE = VIRTUAL_CASH, now.date()
+                POS_SIZE = VIRTUAL_CASH / TOTAL_POSITIONS
                 analyze_sectors()
-                send_msg(f"♻️ *Daily Reset:* Equity {total:.2f}$ | Pos Size {POS_SIZE:.2f}$")
+                save_current_state()
 
-            monitor_market()
+            handle_telegram_commands()
+            monitor()
             
             tkrs = exchange.fetch_tickers()
-            sorted_tkrs = sorted(tkrs.items(), key=lambda x: x[1]['quoteVolume'] or 0, reverse=True)
-            symbols = [s for s, t in sorted_tkrs if '/USDT' in s and (t['quoteVolume'] or 0) > 100000][:800]
+            symbols = [s for s, t in sorted(tkrs.items(), key=lambda x: x[1]['quoteVolume'] or 0, reverse=True) if '/USDT' in s][:800]
             
             with ThreadPoolExecutor(max_workers=15) as exe: exe.map(process_symbol, symbols)
-            time.sleep(60)
-        except Exception as e:
             time.sleep(30)
+        except: time.sleep(10)
