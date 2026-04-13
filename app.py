@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- إعدادات الهوية والاتصال ---
 TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+CHAT_ID = "5067771509"
 
 # --- متغيرات المحفظة وإدارة المخاطر ---
 MAX_OPEN_POSITIONS = 20
